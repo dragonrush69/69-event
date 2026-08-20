@@ -111,6 +111,11 @@ const SCRAPE_MINI_EVENTS = [
   "Silver Rush", "Wargames", "Gold Rush", "Call of Duty", "Beastslayer",
   "War Tools", "Crypt Raiders", "The Quest for Chests", "The King's Mercy",
 ];
+// "Thirst for Battle" is a Weekly event in index.html's MAIN_EVENTS but is
+// deliberately NOT scraped here — it always runs at the exact same time as
+// "Clash for the Throne" (confirmed by Kirsty), so index.html aliases its
+// timing lookup to that event's scraped data instead (see
+// EVENT_TIMING_ALIAS in index.html) rather than scraping it twice.
 const SCRAPE_MAIN_EVENTS_BY_CATEGORY = {
   monthly:  ["Ragnarok", "Armageddon", "Dark Omens", "Shadow Invasion", "Hellforge", "Trials of Olympus"],
   weekly:   ["Doomsday", "Arachne", "Ancient's Treasure", "Rise of the Ancients"],
@@ -268,6 +273,13 @@ function createHourlyScrapeTrigger() {
   ScriptApp.getProjectTriggers().forEach(function(t) {
     if (t.getHandlerFunction() === "scrapeEventSchedule") ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger("scrapeEventSchedule").timeBased().everyHours(1).create();
-  Logger.log("Hourly scrape trigger created — scrapeEventSchedule() will now run automatically every hour.");
+  // .nearMinute(2) asks Apps Script to fire close to 2 minutes past each hour
+  // instead of at a random offset anywhere in the hour (the default for
+  // plain everyHours(1)). That keeps the cached schedule close behind the
+  // source site's own hourly reset — a couple of minutes' margin so the
+  // page has settled, instead of drifting up to ~59 minutes stale.
+  // Apps Script only guarantees this within roughly a 15-minute window, not
+  // to the exact minute, but it's the closest control it offers.
+  ScriptApp.newTrigger("scrapeEventSchedule").timeBased().everyHours(1).nearMinute(2).create();
+  Logger.log("Hourly scrape trigger created — scrapeEventSchedule() will now run automatically near the top of every hour (~2 minutes past).");
 }

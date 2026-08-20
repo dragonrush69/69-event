@@ -119,11 +119,21 @@ const MAIN_EVENTS = [
   { name: "Arachne",            category: "weekly",   hasDivisions: true },
   { name: "Ancient's Treasure", category: "weekly",   hasDivisions: true },
   { name: "Rise of the Ancients", category: "weekly", hasDivisions: true },
+  { name: "Thirst for Battle",  category: "weekly",   hasDivisions: true },
   { name: "Clash for the Throne", category: "biweekly", hasDivisions: false },
   { name: "Clash of Kingdoms",  category: "biweekly", hasDivisions: false },
 ];
 const MAIN_EVENT_LOOKUP = Object.fromEntries(MAIN_EVENTS.map(e => [e.name, e]));
 const MAIN_CATEGORY_LABEL = { monthly: "Monthly", weekly: "Weekly", biweekly: "Biweekly" };
+
+// Some events run at the exact same time as another event that's already
+// scraped, rather than needing to be scraped separately — Kirsty confirmed
+// "Thirst for Battle" always runs simultaneously with "Clash for the
+// Throne" (which itself already runs simultaneously with "Clash of
+// Kingdoms"). Alias its timing lookup instead of adding a redundant scrape.
+const EVENT_TIMING_ALIAS = {
+  "Thirst for Battle": { category: "biweekly", name: "Clash for the Throne" },
+};
 
 function emptyEventEntry() {
   return { tip: "", history: [] }; // history: [{ id, date, highest, lowest, division? }], newest first, max 3
@@ -600,8 +610,11 @@ function formatDayLabel(day) {
 
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
 function getScheduleItem(category, name) {
+  const alias = EVENT_TIMING_ALIAS[name];
+  const lookupCategory = alias ? alias.category : category;
+  const lookupName = alias ? alias.name : name;
   const schedule = Store.get("schedule") || { items: [] };
-  return (schedule.items || []).find(i => i.category === category && i.name === name) || null;
+  return (schedule.items || []).find(i => i.category === lookupCategory && i.name === lookupName) || null;
 }
 
 // Live-updating clock so countdowns tick down on screen instead of showing a
