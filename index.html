@@ -136,7 +136,11 @@ const EVENT_TIMING_ALIAS = {
 };
 
 function emptyEventEntry() {
-  return { tip: "", history: [] }; // history: [{ id, date, highest, lowest, division? }], newest first, max 3
+  return {
+    tip: "",
+    rewards: { first: "", rest: "" }, // 1st place, and 2nd-100th place (same reward across that whole range)
+    history: [], // [{ id, date, highest, lowest, division? }], newest first, max 3
+  };
 }
 
 function buildDefaultMiniEvents() {
@@ -617,6 +621,23 @@ function getScheduleItem(category, name) {
   return (schedule.items || []).find(i => i.category === lookupCategory && i.name === lookupName) || null;
 }
 
+// Sorts event list cards so "Running now" surfaces first, then soonest-
+// starting upcoming events, then anything with no timing data yet — in that
+// priority order. Ties (e.g. several events with no timing) keep their
+// original list order since Array#sort is stable in all supported browsers.
+function timingRank(sched) {
+  if (!sched) return [2, 0];
+  if (sched.running) return [0, 0];
+  if (sched.nextStart) return [1, new Date(sched.nextStart).getTime()];
+  return [2, 0];
+}
+function sortByTiming(items, getSched) {
+  return [...items]
+    .map((item, i) => ({ item, i, rank: timingRank(getSched(item)) }))
+    .sort((a, b) => (a.rank[0] - b.rank[0]) || (a.rank[1] - b.rank[1]) || (a.i - b.i))
+    .map(x => x.item);
+}
+
 // Live-updating clock so countdowns tick down on screen instead of showing a
 // fixed date. Each component using this gets its own 1-second interval.
 function useTicker() {
@@ -701,6 +722,34 @@ const cardStyle = {
   border: "1px solid #e2e8f0", borderRadius: 10, padding: "12px 14px",
 };
 
+// Split out of Hints & Tips per Kirsty's request — 1st place reward and a
+// single combined reward for everyone from 2nd through 100th place. Shown
+// on both Mini and Main event detail pages, right after Hints & Tips.
+const RewardsBlock = ({ rewards }) => {
+  const r = rewards || {};
+  const hasAny = !!(r.first || r.rest);
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Rewards</div>
+      <div style={{
+        background: "#fff", border: "1px dashed #cbd5e1", borderRadius: 10,
+        padding: 14, fontSize: 13, color: hasAny ? "#0f172a" : "#94a3b8",
+      }}>
+        {hasAny ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {r.first && (
+              <div><span style={{ fontWeight: 700 }}>1st: </span>{r.first}</div>
+            )}
+            {r.rest && (
+              <div><span style={{ fontWeight: 700 }}>2nd - 100th: </span>{r.rest}</div>
+            )}
+          </div>
+        ) : "No rewards added yet — these will be added and can be edited from Admin."}
+      </div>
+    </div>
+  );
+};
+
 const MiniEventDetail = ({ name, onBack, onChanged }) => {
   const session = useSession();
   const canEnter = roleAtLeast(session.role, "superior"); // direct save, no approval
@@ -771,6 +820,8 @@ const MiniEventDetail = ({ name, onBack, onChanged }) => {
           {ev.tip || "No tips added yet — these will be added and can be edited from Admin."}
         </div>
       </div>
+
+      <RewardsBlock rewards={ev.rewards} />
 
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Last 3 scores</div>
@@ -1068,6 +1119,8 @@ const MainEventDetail = ({ name, onBack, onChanged }) => {
         </div>
       </div>
 
+      <RewardsBlock rewards={ev.rewards} />
+
       <EpicsSection eventName={name} />
 
       <div style={{ marginBottom: 20 }}>
@@ -1223,7 +1276,7 @@ const MainEventsScreen = () => {
             {MAIN_CATEGORY_LABEL[cat]}
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {MAIN_EVENTS.filter(e => e.category === cat).map(e => {
+            {sortByTiming(MAIN_EVENTS.filter(e => e.category === cat), e => getScheduleItem(e.category, e.name)).map(e => {
               const ev = Store.getMainEvent(e.name);
               const latest = ev.history[0];
               const pendingCount = canSeePending ? pending.filter(p => p.category === "main" && p.eventName === e.name).length : 0;
@@ -1339,7 +1392,7 @@ const MiniEventsScreen = () => {
         19 short cross-kingdom league events — tap one for timing, tips &amp; scores.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {MINI_EVENTS.map(name => {
+        {sortByTiming(MINI_EVENTS, name => getScheduleItem("mini", name)).map(name => {
           const ev = Store.getMiniEvent(name);
           const latest = ev.history[0];
           const pendingCount = canSeePending ? pending.filter(p => p.category === "mini" && p.eventName === name).length : 0;
@@ -1499,7 +1552,10 @@ const AdminTips = () => {
   const [eventName, setEventName] = useState(options[0]?.name || "");
   const kind = category === "mini" ? "mini" : "main";
   const [tipDraft, setTipDraft] = useState("");
-  const [saved, setSaved] = useState(false);
+  const [tipSaved, setTipSaved] = useState(false);
+  const [rewardFirst, setRewardFirst] = useState("");
+  const [rewardRest, setRewardRest] = useState("");
+  const [rewardsSaved, setRewardsSaved] = useState(false);
 
   useEffect(() => {
     const opts = eventsForTipCategory(category);
@@ -1507,22 +1563,33 @@ const AdminTips = () => {
   }, [category]);
 
   useEffect(() => {
-    if (!eventName) { setTipDraft(""); return; }
+    if (!eventName) { setTipDraft(""); setRewardFirst(""); setRewardRest(""); return; }
     const current = kind === "mini" ? Store.getMiniEvent(eventName) : Store.getMainEvent(eventName);
     setTipDraft(current.tip || "");
+    setRewardFirst(current.rewards?.first || "");
+    setRewardRest(current.rewards?.rest || "");
   }, [eventName, kind]);
 
-  const save = () => {
+  const saveTip = () => {
     if (!eventName) return;
     if (kind === "mini") Store.setMiniEvent(eventName, { tip: tipDraft });
     else Store.setMainEvent(eventName, { tip: tipDraft });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    setTipSaved(true);
+    setTimeout(() => setTipSaved(false), 1500);
+  };
+
+  const saveRewards = () => {
+    if (!eventName) return;
+    const rewards = { first: rewardFirst, rest: rewardRest };
+    if (kind === "mini") Store.setMiniEvent(eventName, { rewards });
+    else Store.setMainEvent(eventName, { rewards });
+    setRewardsSaved(true);
+    setTimeout(() => setRewardsSaved(false), 1500);
   };
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         <select
           value={category} onChange={e => setCategory(e.target.value)}
           style={{ ...adminInputStyle, flex: "0 0 130px" }}
@@ -1536,14 +1603,30 @@ const AdminTips = () => {
           {options.map(o => <option key={o.name} value={o.name}>{o.name}</option>)}
         </select>
       </div>
+
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", marginBottom: 6 }}>Hints &amp; tips</div>
       <textarea
         value={tipDraft} onChange={e => setTipDraft(e.target.value)}
         placeholder="Hints and tips for this event..."
         rows={4}
         style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box", resize: "vertical", marginBottom: 8 }}
       />
-      <button onClick={save} style={{ ...adminButtonStyle, width: "100%" }}>Save tip</button>
-      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+      <button onClick={saveTip} style={{ ...adminButtonStyle, width: "100%" }}>Save tip</button>
+      {tipSaved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", margin: "20px 0 6px" }}>Rewards</div>
+      <input
+        value={rewardFirst} onChange={e => setRewardFirst(e.target.value)}
+        placeholder="1st place reward"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <input
+        value={rewardRest} onChange={e => setRewardRest(e.target.value)}
+        placeholder="2nd - 100th place reward"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <button onClick={saveRewards} style={{ ...adminButtonStyle, width: "100%" }}>Save rewards</button>
+      {rewardsSaved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
     </div>
   );
 };
@@ -1841,7 +1924,7 @@ const AdminScreen = () => {
     <div style={{ padding: "20px 20px 100px" }}>
       <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Admin</h2>
       <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>
-        Passwords, divisions, event tips &amp; epics.
+        Passwords, divisions, event tips, rewards &amp; epics.
       </p>
 
       <div style={{ marginBottom: 24 }}>
@@ -1855,7 +1938,7 @@ const AdminScreen = () => {
       </div>
 
       <div style={{ marginBottom: 24 }}>
-        <div style={sectionLabelStyle}>Event tips</div>
+        <div style={sectionLabelStyle}>Event tips &amp; rewards</div>
         <AdminTips />
       </div>
 
