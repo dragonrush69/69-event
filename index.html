@@ -509,7 +509,7 @@ const LoginScreen = ({ onLogin }) => {
       minHeight: "100vh", display: "flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center", background: "#0f172a", padding: 24,
     }}>
-      <div style={{ fontSize: 40, marginBottom: 4 }}>⚔️</div>
+      <Icon name="shield" size={40} style={{ color: "#f1f5f9", marginBottom: 4 }} />
       <h1 style={{ color: "#f1f5f9", fontSize: 22, margin: "0 0 4px" }}>69 Event Tracker</h1>
       <p style={{ color: "#94a3b8", fontSize: 13, margin: "0 0 28px" }}>Enter PIN to continue</p>
 
@@ -683,6 +683,83 @@ function formatCountdown(ms) {
   return `${secs}s`;
 }
 
+// ─── ICONS ──────────────────────────────────────────────────────────────────
+// Simple single-colour line icons (inherit currentColor from whatever text
+// they sit next to) instead of multi-colour emoji glyphs — used for nav tabs,
+// timing/status indicators, and empty-state messages throughout the app.
+const Icon = ({ name, size = 18, style }) => {
+  const common = {
+    width: size, height: size, viewBox: "0 0 24 24", fill: "none",
+    stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round",
+    style: { display: "block", flexShrink: 0, ...style },
+  };
+  switch (name) {
+    case "feed": // News Feed tab — simple list/document
+      return (
+        <svg {...common}>
+          <rect x="4" y="4" width="16" height="16" rx="2" />
+          <line x1="8" y1="9" x2="16" y2="9" />
+          <line x1="8" y1="13" x2="16" y2="13" />
+          <line x1="8" y1="17" x2="12" y2="17" />
+        </svg>
+      );
+    case "clock": // Mini Events tab, "starts in" hints
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" />
+        </svg>
+      );
+    case "trophy": // Main Events tab, Rewards
+      return (
+        <svg {...common}>
+          <path d="M7 4h10v4a5 5 0 0 1-10 0V4Z" />
+          <path d="M7 5H4a3 3 0 0 0 3 3" />
+          <path d="M17 5h3a3 3 0 0 1-3 3" />
+          <line x1="12" y1="13" x2="12" y2="17" />
+          <path d="M9 20h6l-1-3h-4l-1 3Z" />
+        </svg>
+      );
+    case "inbox": // Approvals tab
+      return (
+        <svg {...common}>
+          <path d="M3 13h5l2 3h4l2-3h5" />
+          <path d="M5.5 5h13L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5L5.5 5Z" />
+        </svg>
+      );
+    case "gear": { // Admin tab
+      const teeth = [0, 45, 90, 135, 180, 225, 270, 315];
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="4" />
+          {teeth.map(deg => (
+            <line key={deg} x1="12" y1="3" x2="12" y2="5.4" transform={`rotate(${deg} 12 12)`} />
+          ))}
+        </svg>
+      );
+    }
+    case "dot": // "running now" indicator — filled, sits inline with status text
+      return <svg {...common}><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" /></svg>;
+    case "hourglass": // loading screen
+      return (
+        <svg {...common}>
+          <line x1="6" y1="3" x2="18" y2="3" /><line x1="6" y1="21" x2="18" y2="21" />
+          <path d="M6 3v3.5a6 6 0 0 0 12 0V3" />
+          <path d="M6 21v-3.5a6 6 0 0 1 12 0V21" />
+        </svg>
+      );
+    case "shield": // login screen logo
+      return (
+        <svg {...common}>
+          <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3Z" />
+          <path d="M9 12l2 2 4-4" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+};
+
 const TimingBanner = ({ category, name }) => {
   const item = getScheduleItem(category, name);
   const schedule = Store.get("schedule") || {};
@@ -693,8 +770,10 @@ const TimingBanner = ({ category, name }) => {
       <div style={{
         background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10,
         padding: "10px 14px", fontSize: 13, color: "#1e40af", marginBottom: 16,
+        display: "flex", alignItems: "flex-start", gap: 8,
       }}>
-        ⏱ Timing isn't connected yet — once the schedule sync is set up, this will show what's running now and what's coming up next.
+        <Icon name="clock" size={16} style={{ marginTop: 1 }} />
+        <span>Timing isn't connected yet — once the schedule sync is set up, this will show what's running now and what's coming up next.</span>
       </div>
     );
   }
@@ -709,10 +788,15 @@ const TimingBanner = ({ category, name }) => {
       color: item.running ? "#166534" : "#1e40af", marginBottom: 16,
     }}>
       {item.running && (
-        <div style={{ fontWeight: 700, marginBottom: countdown ? 4 : 0 }}>🟢 Running now</div>
+        <div style={{ fontWeight: 700, marginBottom: countdown ? 4 : 0, display: "flex", alignItems: "center", gap: 6 }}>
+          <Icon name="dot" size={10} /> Running now
+        </div>
       )}
       {countdown && (
-        <div>{item.running ? "Next after this in " : "⏱ Starts in "}<strong>{countdown}</strong></div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {!item.running && <Icon name="clock" size={14} />}
+          {item.running ? "Next after this in " : "Starts in "}<strong>{countdown}</strong>
+        </div>
       )}
       {!item.running && !countdown && <div>Timing not available for this event yet.</div>}
       {schedule.lastScraped && (
@@ -729,8 +813,9 @@ const TimingHint = ({ sched }) => {
   const countdown = sched.nextStart ? formatCountdown(new Date(sched.nextStart).getTime() - now.getTime()) : null;
   if (!sched.running && !countdown) return null;
   return (
-    <div style={{ fontSize: 12, marginTop: 2, color: sched.running ? "#16a34a" : "#2563eb", fontWeight: 600 }}>
-      {sched.running ? "🟢 Running now" : "Starts in " + countdown}
+    <div style={{ fontSize: 12, marginTop: 2, color: sched.running ? "#16a34a" : "#2563eb", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+      <Icon name={sched.running ? "dot" : "clock"} size={sched.running ? 9 : 12} />
+      {sched.running ? "Running now" : "Starts in " + countdown}
     </div>
   );
 };
@@ -1439,6 +1524,108 @@ const MiniEventsScreen = () => {
   );
 };
 
+// ─── NEWS FEED (landing screen) ────────────────────────────────────────────
+// Everything running right now, or starting within the next 24 hours, across
+// both Mini and Main events, with whatever Rewards have been entered for it.
+// This is what Kirsty sees first on opening the app.
+const FEED_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const FeedRewardsLine = ({ rewards }) => {
+  const r = rewards || {};
+  const hasAny = !!(r.first || r.rest);
+  if (!hasAny) {
+    return (
+      <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 6, display: "flex", alignItems: "center", gap: 5 }}>
+        <Icon name="trophy" size={13} /> Rewards not added yet
+      </div>
+    );
+  }
+  return (
+    <div style={{ fontSize: 12, color: "#0f172a", marginTop: 6, display: "flex", flexDirection: "column", gap: 3 }}>
+      {r.first && (
+        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <Icon name="trophy" size={13} /> <span style={{ fontWeight: 700 }}>1st:</span> {r.first}
+        </div>
+      )}
+      {r.rest && (
+        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+          <Icon name="trophy" size={13} /> <span style={{ fontWeight: 700 }}>2nd - 100th:</span> {r.rest}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const NewsFeedScreen = () => {
+  const now = useTicker();
+  const schedule = Store.get("schedule") || { items: [] };
+  const hasScheduleData = (schedule.items || []).length > 0;
+
+  const feedItems = [
+    ...MINI_EVENTS.map(name => ({ badge: "Mini", category: "mini", name, ev: Store.getMiniEvent(name) })),
+    ...MAIN_EVENTS.map(e => ({ badge: MAIN_CATEGORY_LABEL[e.category], category: e.category, name: e.name, ev: Store.getMainEvent(e.name) })),
+  ]
+    .map(item => ({ ...item, sched: getScheduleItem(item.category, item.name) }))
+    .filter(item => item.sched && (
+      item.sched.running ||
+      (item.sched.nextStart && new Date(item.sched.nextStart).getTime() - now.getTime() <= FEED_WINDOW_MS)
+    ));
+
+  const sorted = sortByTiming(feedItems, item => item.sched);
+
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>News Feed</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+        Everything running now, or starting in the next 24 hours, with the rewards on offer.
+      </p>
+
+      {!hasScheduleData ? (
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>
+          Timing isn't connected yet — once the schedule sync is set up, this feed will show what's running now and what's starting soon.
+        </div>
+      ) : sorted.length === 0 ? (
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>
+          Nothing running or starting in the next 24 hours right now — check back later.
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {sorted.map(item => {
+            const countdown = !item.sched.running && item.sched.nextStart
+              ? formatCountdown(new Date(item.sched.nextStart).getTime() - now.getTime())
+              : null;
+            return (
+              <div key={`${item.category}-${item.name}`} style={cardStyle}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{item.name}</div>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap" }}>
+                    {item.badge}
+                  </span>
+                </div>
+                <div style={{ fontSize: 12, marginTop: 2, color: item.sched.running ? "#16a34a" : "#2563eb", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+                  <Icon name={item.sched.running ? "dot" : "clock"} size={item.sched.running ? 9 : 12} />
+                  {item.sched.running ? "Running now" : "Starts in " + countdown}
+                </div>
+                <FeedRewardsLine rewards={item.ev.rewards} />
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {schedule.lastScraped && (
+        <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 16, textAlign: "center" }}>Updated {formatDateTime(schedule.lastScraped)}</div>
+      )}
+    </div>
+  );
+};
+
 // ─── ADMIN ──────────────────────────────────────────────────────────────────
 const sectionLabelStyle = { fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 8 };
 const adminInputStyle = { flex: 1, minWidth: 0, padding: "9px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 };
@@ -1970,10 +2157,11 @@ const AdminScreen = () => {
 
 // ─── APP SHELL ──────────────────────────────────────────────────────────────
 const TABS = [
-  { key: "mini", label: "Mini Events", icon: "⏱️", minRole: "viewer" },
-  { key: "main", label: "Main Events", icon: "🏆", minRole: "viewer" },
-  { key: "approvals", label: "Approvals", icon: "📥", minRole: "superior" },
-  { key: "admin", label: "Admin", icon: "⚙️", minRole: "admin" },
+  { key: "feed", label: "News Feed", icon: "feed", minRole: "viewer" },
+  { key: "mini", label: "Mini Events", icon: "clock", minRole: "viewer" },
+  { key: "main", label: "Main Events", icon: "trophy", minRole: "viewer" },
+  { key: "approvals", label: "Approvals", icon: "inbox", minRole: "superior" },
+  { key: "admin", label: "Admin", icon: "gear", minRole: "admin" },
 ];
 
 const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
@@ -1983,7 +2171,7 @@ const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
 const FULL_HEIGHT = (typeof CSS !== "undefined" && CSS.supports && CSS.supports("height", "100dvh")) ? "100dvh" : "100vh";
 
 const AppShell = ({ role, onLogout }) => {
-  const [tab, setTab] = useState("mini");
+  const [tab, setTab] = useState("feed");
   const visibleTabs = TABS.filter(t => roleAtLeast(role, t.minRole));
   const pendingCount = roleAtLeast(role, "superior") ? Store.getPending().length : 0;
 
@@ -2011,6 +2199,7 @@ const AppShell = ({ role, onLogout }) => {
         </header>
 
         <main style={{ flex: 1, overflowY: "auto" }}>
+          {tab === "feed" && <NewsFeedScreen />}
           {tab === "mini" && <MiniEventsScreen />}
           {tab === "main" && <MainEventsScreen />}
           {tab === "approvals" && <ApprovalsScreen />}
@@ -2033,8 +2222,8 @@ const AppShell = ({ role, onLogout }) => {
                 fontWeight: tab === t.key ? 600 : 400,
               }}
             >
-              <span style={{ position: "relative", fontSize: 20 }}>
-                {t.icon}
+              <span style={{ position: "relative", display: "flex" }}>
+                <Icon name={t.icon} size={20} />
                 {t.key === "approvals" && pendingCount > 0 && (
                   <span style={{
                     position: "absolute", top: -4, right: -10, background: "#dc2626", color: "#fff",
@@ -2056,7 +2245,7 @@ const LoadingScreen = ({ text }) => (
     minHeight: "100vh", display: "flex", flexDirection: "column",
     alignItems: "center", justifyContent: "center", background: "#f8fafc", gap: 12,
   }}>
-    <div style={{ fontSize: 32 }}>⏳</div>
+    <Icon name="hourglass" size={32} style={{ color: "#94a3b8" }} />
     <div style={{ color: "#64748b", fontSize: 14 }}>{text}</div>
   </div>
 );
