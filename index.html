@@ -616,42 +616,87 @@ function formatDayLabel(day) {
 }
 
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
-function getScheduleItem(category, name) {
+// How long before an event's own hour-boundary transition it starts being
+// flagged as "ending soon" rather than a plain "Running now".
+const ENDING_SOON_MS = 2 * 60 * 1000;
+
+// The hourly scrape (~2 min past the hour, per the Apps Script trigger) can
+// lag up to ~15+ minutes behind the real in-game hour-reset, so its cached
+// `running` flag can be stale right around a transition. But every event's
+// own `nextStart` IS the exact hour-boundary the site computed at scrape
+// time — so the live client-side clock can be trusted more than the cached
+// flag once "now" has actually passed it:
+//  - within the last ENDING_SOON_MS before nextStart while running → flag
+//    as "ending soon" instead of a plain "running"
+//  - once now has passed nextStart while still cached as running → that run
+//    has ended and we don't yet know what replaces it (no fresh scrape data
+//    yet) → neither confidently running nor confidently timed
+//  - once now has passed nextStart while NOT running → the predicted start
+//    has already happened → optimistically treat it as running now, rather
+//    than showing a frozen/stale "Starts in" countdown
+// Kirsty (2026-08-20): "2 mins before it should say it is ending, on the
+// hour it should show the new event starting" — this is what drives both
+// display AND list sort order for every event, not just the aliased ones.
+function getEffectiveSchedule(sched, now) {
+  if (!sched) return null;
+  const nextStartMs = sched.nextStart ? new Date(sched.nextStart).getTime() : null;
+  const msToNext = nextStartMs != null ? nextStartMs - now.getTime() : null;
+
+  if (sched.running) {
+    if (msToNext != null && msToNext <= 0) {
+      return { running: false, endingSoon: false, msToNext: null, justEnded: true };
+    }
+    return { running: true, endingSoon: msToNext != null && msToNext <= ENDING_SOON_MS, msToNext, justEnded: false };
+  }
+
+  if (msToNext != null && msToNext <= 0) {
+    return { running: true, endingSoon: false, msToNext: null, justEnded: false };
+  }
+  return { running: false, endingSoon: false, msToNext, justEnded: false };
+}
+
+function getScheduleItem(category, name, now) {
   const alias = EVENT_TIMING_ALIAS[name];
   const schedule = Store.get("schedule") || { items: [] };
   const items = schedule.items || [];
+  const asOf = now || new Date();
 
   if (alias) {
     // Kirsty confirmed "Thirst for Battle" runs at the exact same time as
     // BOTH "Clash for the Throne" and "Clash of Kingdoms" — check every
     // aliased target rather than just one, so a scraping hiccup on either
-    // source alone doesn't wrongly show "not running"/no timing. If any
-    // target is currently running, show that. Otherwise show whichever
-    // target's next start is soonest.
+    // source alone doesn't wrongly show "not running"/no timing. Pick by
+    // each target's EFFECTIVE state (see getEffectiveSchedule above), not
+    // just the raw cached `running` flag, so the aliased event flips to
+    // whichever source is actually current the moment the hour ticks over.
     const targets = alias.map(a => items.find(i => i.category === a.category && i.name === a.name)).filter(Boolean);
     if (targets.length === 0) return null;
-    const running = targets.find(t => t.running);
-    if (running) return running;
-    const upcoming = targets.filter(t => t.nextStart).sort((a, b) => new Date(a.nextStart).getTime() - new Date(b.nextStart).getTime());
-    return upcoming[0] || targets[0];
+    const withEffective = targets.map(t => ({ t, eff: getEffectiveSchedule(t, asOf) }));
+    const running = withEffective.find(x => x.eff && x.eff.running);
+    if (running) return running.t;
+    const upcoming = withEffective
+      .filter(x => x.eff && x.eff.msToNext != null)
+      .sort((a, b) => a.eff.msToNext - b.eff.msToNext);
+    return upcoming[0] ? upcoming[0].t : targets[0];
   }
 
   return items.find(i => i.category === category && i.name === name) || null;
 }
 
-// Sorts event list cards so "Running now" surfaces first, then soonest-
-// starting upcoming events, then anything with no timing data yet — in that
-// priority order. Ties (e.g. several events with no timing) keep their
-// original list order since Array#sort is stable in all supported browsers.
-function timingRank(sched) {
-  if (!sched) return [2, 0];
-  if (sched.running) return [0, 0];
-  if (sched.nextStart) return [1, new Date(sched.nextStart).getTime()];
+// Sorts event list cards so "Running now" (including "ending soon") surfaces
+// first, then soonest-starting upcoming events, then anything with no usable
+// timing data — in that priority order. Ties (e.g. several events with no
+// timing) keep their original list order since Array#sort is stable in all
+// supported browsers.
+function timingRank(effective) {
+  if (!effective) return [2, 0];
+  if (effective.running) return [0, 0];
+  if (effective.msToNext != null) return [1, effective.msToNext];
   return [2, 0];
 }
-function sortByTiming(items, getSched) {
+function sortByTiming(items, getEffective) {
   return [...items]
-    .map((item, i) => ({ item, i, rank: timingRank(getSched(item)) }))
+    .map((item, i) => ({ item, i, rank: timingRank(getEffective(item)) }))
     .sort((a, b) => (a.rank[0] - b.rank[0]) || (a.rank[1] - b.rank[1]) || (a.i - b.i))
     .map(x => x.item);
 }
@@ -761,9 +806,9 @@ const Icon = ({ name, size = 18, style }) => {
 };
 
 const TimingBanner = ({ category, name }) => {
-  const item = getScheduleItem(category, name);
-  const schedule = Store.get("schedule") || {};
   const now = useTicker();
+  const item = getScheduleItem(category, name, now);
+  const schedule = Store.get("schedule") || {};
 
   if (!item) {
     return (
@@ -778,30 +823,51 @@ const TimingBanner = ({ category, name }) => {
     );
   }
 
-  const countdown = item.nextStart ? formatCountdown(new Date(item.nextStart).getTime() - now.getTime()) : null;
+  const eff = getEffectiveSchedule(item, now);
+  const updatedLine = schedule.lastScraped && (
+    <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>Updated {formatDateTime(schedule.lastScraped)}</div>
+  );
+
+  if (eff.running) {
+    return (
+      <div style={{
+        background: eff.endingSoon ? "#fffbeb" : "#f0fdf4",
+        border: "1px solid " + (eff.endingSoon ? "#fde68a" : "#bbf7d0"),
+        borderRadius: 10, padding: "10px 14px", fontSize: 13,
+        color: eff.endingSoon ? "#92400e" : "#166534", marginBottom: 16,
+      }}>
+        <div style={{ fontWeight: 700, marginBottom: eff.endingSoon ? 4 : 0, display: "flex", alignItems: "center", gap: 6 }}>
+          <Icon name="dot" size={10} /> {eff.endingSoon ? "Ending soon" : "Running now"}
+        </div>
+        {eff.endingSoon && eff.msToNext != null && (
+          <div>Ends in <strong>{formatCountdown(eff.msToNext)}</strong></div>
+        )}
+        {updatedLine}
+      </div>
+    );
+  }
+
+  if (eff.msToNext != null) {
+    return (
+      <div style={{
+        background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10,
+        padding: "10px 14px", fontSize: 13, color: "#1e40af", marginBottom: 16,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <Icon name="clock" size={14} /> Starts in <strong>{formatCountdown(eff.msToNext)}</strong>
+        </div>
+        {updatedLine}
+      </div>
+    );
+  }
 
   return (
     <div style={{
-      background: item.running ? "#f0fdf4" : "#eff6ff",
-      border: "1px solid " + (item.running ? "#bbf7d0" : "#bfdbfe"),
-      borderRadius: 10, padding: "10px 14px", fontSize: 13,
-      color: item.running ? "#166534" : "#1e40af", marginBottom: 16,
+      background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10,
+      padding: "10px 14px", fontSize: 13, color: "#1e40af", marginBottom: 16,
     }}>
-      {item.running && (
-        <div style={{ fontWeight: 700, marginBottom: countdown ? 4 : 0, display: "flex", alignItems: "center", gap: 6 }}>
-          <Icon name="dot" size={10} /> Running now
-        </div>
-      )}
-      {countdown && (
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          {!item.running && <Icon name="clock" size={14} />}
-          {item.running ? "Next after this in " : "Starts in "}<strong>{countdown}</strong>
-        </div>
-      )}
-      {!item.running && !countdown && <div>Timing not available for this event yet.</div>}
-      {schedule.lastScraped && (
-        <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>Updated {formatDateTime(schedule.lastScraped)}</div>
-      )}
+      <div>{eff.justEnded ? "Just wrapped up — refreshing shortly." : "Timing not available for this event yet."}</div>
+      {updatedLine}
     </div>
   );
 };
@@ -810,14 +876,26 @@ const TimingBanner = ({ category, name }) => {
 const TimingHint = ({ sched }) => {
   const now = useTicker();
   if (!sched) return null;
-  const countdown = sched.nextStart ? formatCountdown(new Date(sched.nextStart).getTime() - now.getTime()) : null;
-  if (!sched.running && !countdown) return null;
-  return (
-    <div style={{ fontSize: 12, marginTop: 2, color: sched.running ? "#16a34a" : "#2563eb", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
-      <Icon name={sched.running ? "dot" : "clock"} size={sched.running ? 9 : 12} />
-      {sched.running ? "Running now" : "Starts in " + countdown}
-    </div>
-  );
+  const eff = getEffectiveSchedule(sched, now);
+  if (!eff) return null;
+
+  if (eff.running) {
+    return (
+      <div style={{ fontSize: 12, marginTop: 2, color: eff.endingSoon ? "#b45309" : "#16a34a", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+        <Icon name={eff.endingSoon ? "clock" : "dot"} size={eff.endingSoon ? 12 : 9} />
+        {eff.endingSoon ? `Ending soon — ${formatCountdown(eff.msToNext)}` : "Running now"}
+      </div>
+    );
+  }
+  if (eff.msToNext != null) {
+    return (
+      <div style={{ fontSize: 12, marginTop: 2, color: "#2563eb", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+        <Icon name="clock" size={12} />
+        Starts in {formatCountdown(eff.msToNext)}
+      </div>
+    );
+  }
+  return null;
 };
 
 const cardStyle = {
@@ -853,7 +931,7 @@ const RewardsBlock = ({ rewards }) => {
   );
 };
 
-const MiniEventDetail = ({ name, onBack, onChanged }) => {
+const MiniEventDetail = ({ name, onBack, onChanged, backLabel }) => {
   const session = useSession();
   const canEnter = roleAtLeast(session.role, "superior"); // direct save, no approval
   const isViewer = session.role === "viewer";              // submit-for-approval instead
@@ -908,7 +986,7 @@ const MiniEventDetail = ({ name, onBack, onChanged }) => {
       <button onClick={onBack} style={{
         background: "none", border: "none", color: "#2563eb", fontSize: 14,
         padding: "6px 0 14px", fontWeight: 600,
-      }}>&larr; All mini events</button>
+      }}>&larr; {backLabel || "All mini events"}</button>
 
       <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 12px" }}>{name}</h2>
 
@@ -1130,7 +1208,7 @@ const EpicsSection = ({ eventName }) => {
   );
 };
 
-const MainEventDetail = ({ name, onBack, onChanged }) => {
+const MainEventDetail = ({ name, onBack, onChanged, backLabel }) => {
   const meta = MAIN_EVENT_LOOKUP[name] || { category: "monthly", hasDivisions: true };
   const session = useSession();
   const canEnter = roleAtLeast(session.role, "superior");
@@ -1197,7 +1275,7 @@ const MainEventDetail = ({ name, onBack, onChanged }) => {
       <button onClick={onBack} style={{
         background: "none", border: "none", color: "#2563eb", fontSize: 14,
         padding: "6px 0 14px", fontWeight: 600,
-      }}>&larr; All main events</button>
+      }}>&larr; {backLabel || "All main events"}</button>
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
         <h2 style={{ fontSize: 20, color: "#0f172a", margin: 0 }}>{name}</h2>
@@ -1354,6 +1432,7 @@ const MainEventsScreen = () => {
   const canSeePending = roleAtLeast(session.role, "superior");
   const [selected, setSelected] = useState(null);
   const [, setTick] = useState(0);
+  const now = useTicker(); // keeps the running-first sort order flipping live at each event's own hour-boundary
 
   if (selected) {
     return (
@@ -1379,11 +1458,11 @@ const MainEventsScreen = () => {
             {MAIN_CATEGORY_LABEL[cat]}
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {sortByTiming(MAIN_EVENTS.filter(e => e.category === cat), e => getScheduleItem(e.category, e.name)).map(e => {
+            {sortByTiming(MAIN_EVENTS.filter(e => e.category === cat), e => getEffectiveSchedule(getScheduleItem(e.category, e.name, now), now)).map(e => {
               const ev = Store.getMainEvent(e.name);
               const latest = ev.history[0];
               const pendingCount = canSeePending ? pending.filter(p => p.category === "main" && p.eventName === e.name).length : 0;
-              const sched = getScheduleItem(e.category, e.name);
+              const sched = getScheduleItem(e.category, e.name, now);
               return (
                 <button key={e.name} onClick={() => setSelected(e.name)} style={cardStyle}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1475,6 +1554,7 @@ const MiniEventsScreen = () => {
   const canSeePending = roleAtLeast(session.role, "superior");
   const [selected, setSelected] = useState(null);
   const [, setTick] = useState(0);
+  const now = useTicker(); // keeps the running-first sort order flipping live at each event's own hour-boundary
 
   if (selected) {
     return (
@@ -1495,11 +1575,11 @@ const MiniEventsScreen = () => {
         19 short cross-kingdom league events — tap one for timing, tips &amp; scores.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {sortByTiming(MINI_EVENTS, name => getScheduleItem("mini", name)).map(name => {
+        {sortByTiming(MINI_EVENTS, name => getEffectiveSchedule(getScheduleItem("mini", name, now), now)).map(name => {
           const ev = Store.getMiniEvent(name);
           const latest = ev.history[0];
           const pendingCount = canSeePending ? pending.filter(p => p.category === "mini" && p.eventName === name).length : 0;
-          const sched = getScheduleItem("mini", name);
+          const sched = getScheduleItem("mini", name, now);
           return (
             <button key={name} onClick={() => setSelected(name)} style={cardStyle}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1558,20 +1638,31 @@ const FeedRewardsLine = ({ rewards }) => {
 
 const NewsFeedScreen = () => {
   const now = useTicker();
+  const [selected, setSelected] = useState(null); // { category, name } or null
+  const [, setTick] = useState(0);
   const schedule = Store.get("schedule") || { items: [] };
   const hasScheduleData = (schedule.items || []).length > 0;
+
+  // Tapping a feed card opens the exact same detail page Mini/Main Events use
+  // (score entry, hints, rewards, epics — everything). Back returns to the
+  // News Feed list rather than jumping to that event's own tab, so the bottom
+  // nav keeps "News Feed" highlighted the whole time (confirmed with Kirsty).
+  if (selected) {
+    const onBack = () => { setSelected(null); setTick(t => t + 1); };
+    const onChanged = () => setTick(t => t + 1);
+    return selected.category === "mini"
+      ? <MiniEventDetail name={selected.name} onBack={onBack} onChanged={onChanged} backLabel="News Feed" />
+      : <MainEventDetail name={selected.name} onBack={onBack} onChanged={onChanged} backLabel="News Feed" />;
+  }
 
   const feedItems = [
     ...MINI_EVENTS.map(name => ({ badge: "Mini", category: "mini", name, ev: Store.getMiniEvent(name) })),
     ...MAIN_EVENTS.map(e => ({ badge: MAIN_CATEGORY_LABEL[e.category], category: e.category, name: e.name, ev: Store.getMainEvent(e.name) })),
   ]
-    .map(item => ({ ...item, sched: getScheduleItem(item.category, item.name) }))
-    .filter(item => item.sched && (
-      item.sched.running ||
-      (item.sched.nextStart && new Date(item.sched.nextStart).getTime() - now.getTime() <= FEED_WINDOW_MS)
-    ));
+    .map(item => ({ ...item, eff: getEffectiveSchedule(getScheduleItem(item.category, item.name, now), now) }))
+    .filter(item => item.eff && (item.eff.running || (item.eff.msToNext != null && item.eff.msToNext <= FEED_WINDOW_MS)));
 
-  const sorted = sortByTiming(feedItems, item => item.sched);
+  const sorted = sortByTiming(feedItems, item => item.eff);
 
   return (
     <div style={{ padding: "20px 20px 100px" }}>
@@ -1597,23 +1688,29 @@ const NewsFeedScreen = () => {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {sorted.map(item => {
-            const countdown = !item.sched.running && item.sched.nextStart
-              ? formatCountdown(new Date(item.sched.nextStart).getTime() - now.getTime())
-              : null;
+            const eff = item.eff;
+            const statusColor = eff.running ? (eff.endingSoon ? "#b45309" : "#16a34a") : "#2563eb";
+            const statusText = eff.running
+              ? (eff.endingSoon ? `Ending soon — ${formatCountdown(eff.msToNext)}` : "Running now")
+              : `Starts in ${formatCountdown(eff.msToNext)}`;
             return (
-              <div key={`${item.category}-${item.name}`} style={cardStyle}>
+              <button
+                key={`${item.category}-${item.name}`}
+                onClick={() => setSelected({ category: item.category, name: item.name })}
+                style={cardStyle}
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
                   <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{item.name}</div>
                   <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap" }}>
                     {item.badge}
                   </span>
                 </div>
-                <div style={{ fontSize: 12, marginTop: 2, color: item.sched.running ? "#16a34a" : "#2563eb", fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
-                  <Icon name={item.sched.running ? "dot" : "clock"} size={item.sched.running ? 9 : 12} />
-                  {item.sched.running ? "Running now" : "Starts in " + countdown}
+                <div style={{ fontSize: 12, marginTop: 2, color: statusColor, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}>
+                  <Icon name={eff.running && !eff.endingSoon ? "dot" : "clock"} size={eff.running && !eff.endingSoon ? 9 : 12} />
+                  {statusText}
                 </div>
                 <FeedRewardsLine rewards={item.ev.rewards} />
-              </div>
+              </button>
             );
           })}
         </div>
