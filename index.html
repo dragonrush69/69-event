@@ -53,7 +53,7 @@ function roleAtLeast(role, min) {
 // matching AppScript_Backend.js file + setup guide). Until this is filled
 // in, the app runs fine on its own using only the browser's local storage —
 // each device just won't see other devices' data.
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbwRPTohJwtrdEhTjWPKUU2U-wOm07L89QJdItW8zxp5ycCT_XL40jt2N56Kz1t98OH2/exec";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbxdwm-0VtXCsQZWU-2UDJDRU-rtJ6v9R6jt6jC_RptRxVTJJaoGIBh8V7WaQRNdH3HKag/exec";
 
 const sheetsEnabled = () => SHEETS_URL && !SHEETS_URL.startsWith("YOUR_");
 
@@ -234,6 +234,14 @@ const Store = {
     Store._save();
   },
 
+  // Admin/Superior-only: remove a single score entry from a mini event's history.
+  deleteMiniEventEntry(name, entryId) {
+    const data = Store._load();
+    const ev = data.miniEvents[name] || emptyEventEntry();
+    data.miniEvents[name] = { ...ev, history: ev.history.filter(h => h.id !== entryId) };
+    Store._save();
+  },
+
   getMainEvent(name) {
     const data = Store._load();
     return data.mainEvents[name] || emptyEventEntry();
@@ -242,6 +250,14 @@ const Store = {
   setMainEvent(name, patch) {
     const data = Store._load();
     data.mainEvents[name] = { ...emptyEventEntry(), ...data.mainEvents[name], ...patch };
+    Store._save();
+  },
+
+  // Admin/Superior-only: remove a single score entry from a main event's history.
+  deleteMainEventEntry(name, entryId) {
+    const data = Store._load();
+    const ev = data.mainEvents[name] || emptyEventEntry();
+    data.mainEvents[name] = { ...ev, history: ev.history.filter(h => h.id !== entryId) };
     Store._save();
   },
 
@@ -627,10 +643,27 @@ const MiniEventDetail = ({ name, onBack, onChanged }) => {
             {ev.history.map(h => (
               <div key={h.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontSize: 12, color: "#64748b" }}>{formatDateTime(h.date)}</span>
-                <span style={{ fontSize: 13 }}>
+                <span style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(h.highest)}</span>
                   {"  "}
                   <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(h.lowest)}</span>
+                  {canEnter && (
+                    <button
+                      onClick={() => {
+                        if (window.confirm("Delete this score entry? This can't be undone.")) {
+                          Store.deleteMiniEventEntry(name, h.id);
+                          setTick(t => t + 1);
+                          onChanged && onChanged();
+                        }
+                      }}
+                      style={{
+                        background: "none", border: "none", color: "#94a3b8", fontSize: 16,
+                        padding: 2, lineHeight: 1,
+                      }}
+                      aria-label="Delete score"
+                      title="Delete score"
+                    >🗑️</button>
+                  )}
                 </span>
               </div>
             ))}
@@ -832,10 +865,27 @@ const MainEventDetail = ({ name, onBack, onChanged }) => {
                   {formatDateTime(h.date)}
                   {h.division ? ` · Division ${h.division}` : ""}
                 </span>
-                <span style={{ fontSize: 13 }}>
+                <span style={{ fontSize: 13, display: "flex", alignItems: "center", gap: 10 }}>
                   <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(h.highest)}</span>
                   {"  "}
                   <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(h.lowest)}</span>
+                  {canEnter && (
+                    <button
+                      onClick={() => {
+                        if (window.confirm("Delete this score entry? This can't be undone.")) {
+                          Store.deleteMainEventEntry(name, h.id);
+                          setTick(t => t + 1);
+                          onChanged && onChanged();
+                        }
+                      }}
+                      style={{
+                        background: "none", border: "none", color: "#94a3b8", fontSize: 16,
+                        padding: 2, lineHeight: 1,
+                      }}
+                      aria-label="Delete score"
+                      title="Delete score"
+                    >🗑️</button>
+                  )}
                 </span>
               </div>
             ))}
@@ -1137,6 +1187,32 @@ const AdminPinRow = ({ role }) => {
   );
 };
 
+// Pick which role's PIN to change, then edit just that one — avoids showing
+// all three PINs at once.
+const AdminPasswords = () => {
+  const [role, setRole] = useState("viewer");
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {["viewer", "superior", "admin"].map(r => (
+          <button
+            key={r}
+            onClick={() => setRole(r)}
+            style={{
+              flex: 1, padding: "8px 6px", borderRadius: 8, fontSize: 13, fontWeight: 600,
+              border: "1px solid " + (role === r ? "#0f172a" : "#cbd5e1"),
+              background: role === r ? "#0f172a" : "#fff",
+              color: role === r ? "#fff" : "#0f172a",
+            }}
+          >{PIN_ROLE_LABEL[r]}</button>
+        ))}
+      </div>
+      {/* key={role} remounts the row on role change so its field resets to that role's current PIN */}
+      <AdminPinRow key={role} role={role} />
+    </div>
+  );
+};
+
 const AdminDivisions = () => {
   const [, setTick] = useState(0);
   const [newDiv, setNewDiv] = useState("");
@@ -1273,9 +1349,7 @@ const AdminScreen = () => {
 
       <div style={{ marginBottom: 24 }}>
         <div style={sectionLabelStyle}>Passwords</div>
-        <AdminPinRow role="viewer" />
-        <AdminPinRow role="superior" />
-        <AdminPinRow role="admin" />
+        <AdminPasswords />
       </div>
 
       <div style={{ marginBottom: 24 }}>
@@ -1301,6 +1375,10 @@ const TABS = [
 
 const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
 
+// 100dvh tracks the real visible height on phones (accounting for the address
+// bar showing/hiding); 100vh is the fallback for browsers that don't support it.
+const FULL_HEIGHT = (typeof CSS !== "undefined" && CSS.supports && CSS.supports("height", "100dvh")) ? "100dvh" : "100vh";
+
 const AppShell = ({ role, onLogout }) => {
   const [tab, setTab] = useState("mini");
   const visibleTabs = TABS.filter(t => roleAtLeast(role, t.minRole));
@@ -1308,7 +1386,7 @@ const AppShell = ({ role, onLogout }) => {
 
   return (
     <SessionCtx.Provider value={{ role }}>
-      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+      <div style={{ height: FULL_HEIGHT, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <header style={{
           display: "flex", alignItems: "center", justifyContent: "space-between",
           padding: "14px 18px", background: "#0f172a", color: "#f1f5f9",
