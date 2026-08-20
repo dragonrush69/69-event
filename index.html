@@ -148,6 +148,7 @@ const DEFAULT_DATA = {
   mainEvents: buildDefaultMainEvents(),
   schedule: { lastScraped: null, items: [] }, // filled by a future scraper
   pending: [], // viewer-submitted scores awaiting Superior/Admin approval
+  epics: [],   // Admin-entered epic monster stat sheets, linked to a Main Event (+ optional day) — see Store.addEpic
 };
 
 // Fill in a possibly-partial data object (from localStorage or Sheets) with
@@ -160,6 +161,7 @@ function normalizeData(parsed) {
   data.divisions = parsed?.divisions || [];
   data.pending = parsed?.pending || [];
   data.pins = { ...DEFAULT_PINS, ...(parsed?.pins || {}) };
+  data.epics = parsed?.epics || [];
   return data;
 }
 
@@ -335,7 +337,95 @@ const Store = {
     }
     Store._save();
   },
+
+  // ── Epics ────────────────────────────────────────────────────────────
+  // Admin-entered monster stat sheets for a Main Event's epic(s). One event
+  // can have several (e.g. a different epic per day) — each is its own
+  // record with a list of monster rows.
+  getEpics() {
+    return Store._load().epics || [];
+  },
+
+  getEpicsForEvent(eventName) {
+    return Store.getEpics().filter(e => e.event === eventName);
+  },
+
+  addEpic(epic) {
+    const data = Store._load();
+    data.epics = [...(data.epics || []), epic];
+    Store._save();
+  },
+
+  updateEpic(id, patch) {
+    const data = Store._load();
+    data.epics = (data.epics || []).map(e => e.id === id ? { ...e, ...patch } : e);
+    Store._save();
+  },
+
+  deleteEpic(id) {
+    const data = Store._load();
+    data.epics = (data.epics || []).filter(e => e.id !== id);
+    Store._save();
+  },
 };
+
+// ── Epic paste parser ───────────────────────────────────────────────────
+// Turns tab-separated rows (pasted straight from a spreadsheet) into a list
+// of monster stat objects. Column order matches a standard export:
+// Epic | # of Monsters | Order | Name | Type 1 | Type 2 | Type 3 |
+// Strength Against | % Strength Against | Initiative | Strength | Health |
+// Leadership | Quantity | Total Health | Total Strength | Captain/Hero |
+// Number of Captains
+// Captain/Hero and Number of Captains are the same for every monster in an
+// epic (confirmed by Kirsty), so they're read once from the first row and
+// returned as epic-level fields rather than being repeated per monster.
+const EPIC_MONSTER_FIELDS = [
+  "order", "name", "type1", "type2", "type3", "strengthAgainst", "pctStrengthAgainst",
+  "initiative", "strength", "health", "leadership", "quantity",
+  "totalHealth", "totalStrength",
+];
+
+// Captain/Hero is a fixed set of options rather than free text.
+const CAPTAIN_HERO_OPTIONS = ["Captain", "Hero", "Hero & Captains"];
+function normalizeCaptainHero(value) {
+  const s = (value || "").trim().toLowerCase();
+  if (!s) return "";
+  const found = CAPTAIN_HERO_OPTIONS.find(o => o.toLowerCase() === s);
+  if (found) return found;
+  if (s === "c") return "Captain";
+  if (s === "h") return "Hero";
+  return ""; // unrecognised abbreviation from a paste — leave for manual selection
+}
+
+function parseEpicPaste(text) {
+  const lines = (text || "").trim().split(/\r?\n/).filter(l => l.trim() !== "");
+  if (lines.length === 0) return { error: "Paste at least one row of monster data." };
+
+  let rows = lines.map(l => l.split("\t"));
+  // Skip a header row if it looks like one (first cell literally "Epic").
+  if (rows[0][0] && rows[0][0].trim().toLowerCase() === "epic") {
+    rows = rows.slice(1);
+  }
+  if (rows.length === 0) return { error: "No data rows found after the header." };
+
+  let epicName = "";
+  let captainHero = "", numCaptains = "";
+  const monsters = [];
+  for (const cols of rows) {
+    const clean = cols.map(c => (c || "").trim());
+    if (clean.length < 4 || !clean[3]) continue; // need at least a Name (col 4) to count as a row
+    if (!epicName && clean[0]) epicName = clean[0];
+    if (!captainHero && clean[16]) captainHero = clean[16];
+    if (!numCaptains && clean[17]) numCaptains = clean[17];
+    const monster = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+    EPIC_MONSTER_FIELDS.forEach((field, i) => { monster[field] = clean[i + 2] || ""; }); // +2 skips Epic, # of Monsters
+    monsters.push(monster);
+  }
+
+  if (!epicName) return { error: "Couldn't find an epic name in the first column of any row." };
+  if (monsters.length === 0) return { error: "Couldn't find any rows with a monster name." };
+  return { epicName, captainHero, numCaptains, monsters };
+}
 
 function resolvePin(pin) {
   const pins = Store.getPins();
@@ -471,6 +561,41 @@ function formatDateTime(iso) {
 }
 function formatScore(n) {
   return Number(n).toLocaleString();
+}
+// Adds thousand-separator commas to values that are plain numbers (e.g.
+// "70000" → "70,000"), while leaving percentages, combined strings, and
+// text codes ("45%", "Mounted", "C") untouched. Used for Epic monster stats,
+// where fields are stored as raw strings but some are large numbers.
+function formatMaybeNum(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const s = String(value).trim();
+  return /^-?\d+(\.\d+)?$/.test(s) ? Number(s).toLocaleString() : value;
+}
+// Abbreviates large plain numbers with K/M/B/T suffixes (e.g. "7310000000000"
+// → "7.31T"), for resource totals like Meat that can run into the trillions.
+// Anything that isn't a plain number (already abbreviated, blank, etc.) is
+// left exactly as entered.
+function formatCompact(value) {
+  if (value === null || value === undefined || value === "") return value;
+  const s = String(value).trim();
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return value;
+  const num = Number(s);
+  const abs = Math.abs(num);
+  const tiers = [
+    { v: 1e12, sfx: "T" }, { v: 1e9, sfx: "B" }, { v: 1e6, sfx: "M" }, { v: 1e3, sfx: "K" },
+  ];
+  for (const t of tiers) {
+    if (abs >= t.v) return `${(num / t.v).toFixed(2).replace(/\.?0+$/, "")}${t.sfx}`;
+  }
+  return num.toLocaleString();
+}
+// Epic "Day" field is often just a plain number ("1", "2") — show it as
+// "1 day" / "2 days" instead of a bare digit. Anything already worded
+// (e.g. "Day 1-2", "Final day") is left exactly as typed.
+function formatDayLabel(day) {
+  const s = (day || "").trim();
+  if (!s) return "";
+  return /^\d+$/.test(s) ? `${s} day${s === "1" ? "" : "s"}` : s;
 }
 
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
@@ -761,6 +886,83 @@ const DivisionSelect = ({ value, onChange, divisions }) => (
   </select>
 );
 
+// ── Epics (Admin-entered monster stat sheets, shown on the Main Event page) ─
+const EpicMonsterCard = ({ m }) => {
+  const types = [m.type1, m.type2, m.type3].filter(Boolean).join(" / ");
+  const stat = (label, value) => (!value ? null : (
+    <div style={{ fontSize: 12 }}>
+      <span style={{ color: "#94a3b8" }}>{label}: </span>
+      <span style={{ color: "#0f172a", fontWeight: 600 }}>{formatMaybeNum(value)}</span>
+    </div>
+  ));
+  return (
+    <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: 10, marginBottom: 6 }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: "#0f172a", marginBottom: 4 }}>
+        {m.order ? `#${m.order} · ` : ""}{m.name}
+      </div>
+      {types && <div style={{ fontSize: 12, color: "#475569", marginBottom: 4 }}>{types}</div>}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px" }}>
+        {stat("Strong vs", m.strengthAgainst && (m.pctStrengthAgainst ? `${m.strengthAgainst} (${m.pctStrengthAgainst})` : m.strengthAgainst))}
+        {stat("Initiative", m.initiative)}
+        {stat("Strength", m.strength)}
+        {stat("Health", m.health)}
+        {stat("Leadership", m.leadership)}
+        {stat("Quantity", m.quantity)}
+        {stat("Total Health", m.totalHealth)}
+        {stat("Total Strength", m.totalStrength)}
+      </div>
+    </div>
+  );
+};
+
+const EpicsSection = ({ eventName }) => {
+  const epics = Store.getEpicsForEvent(eventName);
+  const [expanded, setExpanded] = useState({});
+  if (epics.length === 0) return null;
+  const toggle = (id) => setExpanded(e => ({ ...e, [id]: !e[id] }));
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Epics</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {epics.map(ep => (
+          <div key={ep.id} style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a" }}>{ep.name}</div>
+                <div style={{ fontSize: 12, color: "#64748b" }}>
+                  {ep.day ? `${formatDayLabel(ep.day)} · ` : ""}
+                  {ep.monsters.length} monster{ep.monsters.length === 1 ? "" : "s"}
+                  {ep.numCaptains && ep.captainHero
+                    ? ` · ${formatMaybeNum(ep.numCaptains)} ${ep.captainHero}`
+                    : (ep.captainHero || ep.numCaptains ? ` · ${ep.captainHero || formatMaybeNum(ep.numCaptains)}` : "")}
+                </div>
+                {(ep.meat || ep.chests) && (
+                  <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                    {ep.meat ? `${formatCompact(ep.meat)} Meat` : ""}
+                    {ep.meat && ep.chests ? ", " : ""}
+                    {ep.chests ? `${formatMaybeNum(ep.chests)} chests` : ""}
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => toggle(ep.id)}
+                aria-label={expanded[ep.id] ? "Hide monster details" : "View monster details"}
+                title="View monster details"
+                style={{ background: "none", border: "none", fontSize: 20, padding: 4, lineHeight: 1 }}
+              >ℹ️</button>
+            </div>
+            {expanded[ep.id] && (
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #e2e8f0" }}>
+                {ep.monsters.map(m => <EpicMonsterCard key={m.id} m={m} />)}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 const MainEventDetail = ({ name, onBack, onChanged }) => {
   const meta = MAIN_EVENT_LOOKUP[name] || { category: "monthly", hasDivisions: true };
   const session = useSession();
@@ -852,6 +1054,8 @@ const MainEventDetail = ({ name, onBack, onChanged }) => {
           {ev.tip || "No tips added yet — these will be added and can be edited from Admin."}
         </div>
       </div>
+
+      <EpicsSection eventName={name} />
 
       <div style={{ marginBottom: 20 }}>
         <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Last 3 scores</div>
@@ -1331,6 +1535,286 @@ const AdminTips = () => {
   );
 };
 
+const EPIC_PASTE_PLACEHOLDER =
+  "Optional: paste rows copied from a spreadsheet (tab-separated) to fill the grid below instead of typing:\n" +
+  "Arcanomancer\t4\t1\tArcanomancer\tMelee\t\tEpic\tMounted\t45%\t10\t70000\t210000\t74\t\t0\t0\tC\t3";
+
+// Column order matches Kirsty's spreadsheet layout, minus "Epic" and "# of
+// Monsters" (those are the Epic Name field above the grid, and the row count).
+const MONSTER_FIELD_DEFS = [
+  { key: "order", label: "Order", width: 56 },
+  { key: "name", label: "Name", width: 170 },
+  { key: "type1", label: "Type 1", width: 100 },
+  { key: "type2", label: "Type 2", width: 100 },
+  { key: "type3", label: "Type 3", width: 100 },
+  { key: "strengthAgainst", label: "Strength Against", width: 140 },
+  { key: "pctStrengthAgainst", label: "% Strength Against", width: 110 },
+  { key: "initiative", label: "Initiative", width: 90 },
+  { key: "strength", label: "Strength", width: 100 },
+  { key: "health", label: "Health", width: 100 },
+  { key: "leadership", label: "Leadership", width: 100 },
+  { key: "quantity", label: "Quantity", width: 90 },
+  { key: "totalHealth", label: "Total Health", width: 110 },
+  { key: "totalStrength", label: "Total Strength", width: 110 },
+];
+
+function emptyMonsterRow() {
+  const m = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+  MONSTER_FIELD_DEFS.forEach(f => { m[f.key] = ""; });
+  return m;
+}
+
+const MonsterFieldGrid = ({ monster, onChange }) => (
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+    {MONSTER_FIELD_DEFS.map(f => (
+      <div key={f.key} style={{ flex: `0 0 ${f.width}px`, minWidth: f.width }}>
+        <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2, textTransform: "uppercase", fontWeight: 600 }}>{f.label}</div>
+        <input
+          value={monster[f.key] || ""}
+          onChange={e => onChange(f.key, e.target.value)}
+          style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: "1px solid #cbd5e1", fontSize: 13, boxSizing: "border-box" }}
+        />
+      </div>
+    ))}
+  </div>
+);
+
+const AdminEpics = () => {
+  const [, setTick] = useState(0);
+  const [editingId, setEditingId] = useState(null);
+  const [epicName, setEpicName] = useState("");
+  const [event, setEvent] = useState(MAIN_EVENTS[0].name);
+  const [day, setDay] = useState("");
+  const [captainHero, setCaptainHero] = useState("");
+  const [numCaptains, setNumCaptains] = useState("");
+  const [meat, setMeat] = useState("");
+  const [chests, setChests] = useState("");
+  const [monsters, setMonsters] = useState([emptyMonsterRow()]);
+  const [showPaste, setShowPaste] = useState(false);
+  const [paste, setPaste] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const epics = Store.getEpics();
+
+  const updateMonster = (id, key, value) => {
+    setMonsters(ms => ms.map(m => m.id === id ? { ...m, [key]: value } : m));
+  };
+  const addMonster = () => setMonsters(ms => [...ms, emptyMonsterRow()]);
+  const removeMonster = (id) => setMonsters(ms => ms.length > 1 ? ms.filter(m => m.id !== id) : ms);
+
+  const resetForm = () => {
+    setEditingId(null);
+    setEpicName(""); setEvent(MAIN_EVENTS[0].name); setDay("");
+    setCaptainHero(""); setNumCaptains(""); setMeat(""); setChests(""); setMonsters([emptyMonsterRow()]);
+    setShowPaste(false); setPaste(""); setError("");
+  };
+
+  const startEdit = (ep) => {
+    setError("");
+    setEditingId(ep.id);
+    setEpicName(ep.name || "");
+    setEvent(ep.event || MAIN_EVENTS[0].name);
+    setDay(ep.day || "");
+    setCaptainHero(ep.captainHero || "");
+    setNumCaptains(ep.numCaptains || "");
+    setMeat(ep.meat || "");
+    setChests(ep.chests || "");
+    setMonsters(ep.monsters && ep.monsters.length ? ep.monsters.map(m => ({ ...m })) : [emptyMonsterRow()]);
+    setShowPaste(false);
+    setPaste("");
+  };
+
+  const fillFromPaste = () => {
+    setError("");
+    const result = parseEpicPaste(paste);
+    if (result.error) { setError(result.error); return; }
+    setEpicName(result.epicName);
+    setCaptainHero(normalizeCaptainHero(result.captainHero));
+    setNumCaptains(result.numCaptains || "");
+    setMonsters(result.monsters);
+    setPaste("");
+    setShowPaste(false);
+  };
+
+  const saveEpic = () => {
+    setError("");
+    const cleanName = epicName.trim();
+    if (!cleanName) { setError("Give this epic a name first."); return; }
+    const validMonsters = monsters.filter(m => (m.name || "").trim());
+    if (validMonsters.length === 0) { setError("Add at least one monster with a name."); return; }
+    const payload = {
+      event, day: day.trim(),
+      name: cleanName,
+      captainHero: captainHero.trim(),
+      numCaptains: numCaptains.trim(),
+      meat: meat.trim(),
+      chests: chests.trim(),
+      monsters: validMonsters,
+    };
+    if (editingId) {
+      Store.updateEpic(editingId, payload);
+    } else {
+      Store.addEpic({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...payload });
+    }
+    resetForm();
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+  };
+
+  const remove = (id) => {
+    if (window.confirm("Delete this epic and all its monster data? This can't be undone.")) {
+      Store.deleteEpic(id);
+      if (editingId === id) resetForm();
+      setTick(t => t + 1);
+    }
+  };
+
+  return (
+    <div>
+      {editingId && (
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8,
+          padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#1d4ed8", fontWeight: 600,
+        }}>
+          <span>Editing "{epicName || "epic"}"</span>
+          <button
+            onClick={resetForm}
+            style={{ background: "none", border: "none", color: "#1d4ed8", fontSize: 12, fontWeight: 700, padding: "2px 4px" }}
+          >Cancel</button>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <input
+          value={epicName} onChange={e => setEpicName(e.target.value)}
+          placeholder="Epic name (e.g. Arcanomancer)"
+          style={{ ...adminInputStyle, flex: 2 }}
+        />
+        <input
+          value={day} onChange={e => setDay(e.target.value)}
+          placeholder="Day (optional)"
+          style={{ ...adminInputStyle, flex: 1 }}
+        />
+      </div>
+      <select value={event} onChange={e => setEvent(e.target.value)} style={{ ...adminInputStyle, width: "100%", marginBottom: 8 }}>
+        {MAIN_EVENTS.map(e => <option key={e.name} value={e.name}>{e.name}</option>)}
+      </select>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <select
+          value={captainHero} onChange={e => setCaptainHero(e.target.value)}
+          style={{ ...adminInputStyle, flex: 2, color: captainHero ? "#0f172a" : "#94a3b8" }}
+        >
+          <option value="">Captain / Hero (whole epic)</option>
+          {CAPTAIN_HERO_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+        </select>
+        <input
+          value={numCaptains} onChange={e => setNumCaptains(e.target.value)}
+          placeholder="# Captains"
+          style={{ ...adminInputStyle, flex: 1 }}
+        />
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input
+          value={meat} onChange={e => setMeat(e.target.value)}
+          placeholder="Meat (whole epic)"
+          style={{ ...adminInputStyle, flex: 1 }}
+        />
+        <input
+          value={chests} onChange={e => setChests(e.target.value)}
+          placeholder="Clan chests"
+          style={{ ...adminInputStyle, flex: 1 }}
+        />
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+        {monsters.map((m, idx) => (
+          <div key={m.id} style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b" }}>Monster {idx + 1}</div>
+              {monsters.length > 1 && (
+                <button
+                  onClick={() => removeMonster(m.id)}
+                  style={{ background: "none", border: "none", color: "#dc2626", fontSize: 12, fontWeight: 600 }}
+                >Remove</button>
+              )}
+            </div>
+            <MonsterFieldGrid monster={m} onChange={(key, val) => updateMonster(m.id, key, val)} />
+          </div>
+        ))}
+      </div>
+
+      <button
+        onClick={addMonster}
+        style={{ ...adminButtonStyle, width: "100%", background: "#fff", color: "#0f172a", border: "1px solid #cbd5e1", marginBottom: 10 }}
+      >+ Add monster</button>
+
+      <button
+        onClick={() => setShowPaste(s => !s)}
+        style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "2px 0", marginBottom: 8 }}
+      >{showPaste ? "Hide paste-to-fill" : "Paste from a spreadsheet instead ▾"}</button>
+      {showPaste && (
+        <div style={{ marginBottom: 10 }}>
+          <textarea
+            value={paste} onChange={e => setPaste(e.target.value)}
+            placeholder={EPIC_PASTE_PLACEHOLDER}
+            rows={3}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 12, fontFamily: "monospace", boxSizing: "border-box", resize: "vertical", marginBottom: 6 }}
+          />
+          <button onClick={fillFromPaste} style={{ ...adminButtonStyle, width: "100%" }}>Fill grid from paste</button>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={saveEpic} style={{ ...adminButtonStyle, flex: 1 }}>
+          {editingId ? "Save changes" : "Save epic"}
+        </button>
+        {editingId && (
+          <button
+            onClick={resetForm}
+            style={{ ...adminButtonStyle, flex: 1, background: "#fff", color: "#0f172a", border: "1px solid #cbd5e1" }}
+          >Cancel</button>
+        )}
+      </div>
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 8 }}>{error}</div>}
+
+      {epics.length > 0 && (
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {epics.map(ep => (
+            <div key={ep.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a" }}>{ep.name}</div>
+                <div style={{ fontSize: 12, color: "#64748b" }}>
+                  {ep.event}{ep.day ? ` · ${formatDayLabel(ep.day)}` : ""} · {ep.monsters.length} monster{ep.monsters.length === 1 ? "" : "s"}
+                  {ep.numCaptains && ep.captainHero ? ` · ${formatMaybeNum(ep.numCaptains)} ${ep.captainHero}` : ""}
+                </div>
+                {(ep.meat || ep.chests) && (
+                  <div style={{ fontSize: 12, color: "#64748b" }}>
+                    {ep.meat ? `${formatCompact(ep.meat)} Meat` : ""}
+                    {ep.meat && ep.chests ? ", " : ""}
+                    {ep.chests ? `${formatMaybeNum(ep.chests)} chests` : ""}
+                  </div>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button
+                  onClick={() => startEdit(ep)}
+                  style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Edit</button>
+                <button
+                  onClick={() => remove(ep.id)}
+                  style={{ background: "none", border: "none", color: "#dc2626", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AdminScreen = () => {
   const session = useSession();
   if (!roleAtLeast(session.role, "admin")) {
@@ -1344,7 +1828,7 @@ const AdminScreen = () => {
     <div style={{ padding: "20px 20px 100px" }}>
       <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Admin</h2>
       <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>
-        Passwords, divisions &amp; event tips.
+        Passwords, divisions, event tips &amp; epics.
       </p>
 
       <div style={{ marginBottom: 24 }}>
@@ -1357,9 +1841,14 @@ const AdminScreen = () => {
         <AdminDivisions />
       </div>
 
-      <div>
+      <div style={{ marginBottom: 24 }}>
         <div style={sectionLabelStyle}>Event tips</div>
         <AdminTips />
+      </div>
+
+      <div>
+        <div style={sectionLabelStyle}>Epics</div>
+        <AdminEpics />
       </div>
     </div>
   );
