@@ -113,9 +113,11 @@ const SCRAPE_MINI_EVENTS = [
 ];
 // "Thirst for Battle" is a Weekly event in index.html's MAIN_EVENTS but is
 // deliberately NOT scraped here — it always runs at the exact same time as
-// "Clash for the Throne" (confirmed by Kirsty), so index.html aliases its
-// timing lookup to that event's scraped data instead (see
-// EVENT_TIMING_ALIAS in index.html) rather than scraping it twice.
+// BOTH "Clash for the Throne" and "Clash of Kingdoms" (confirmed by
+// Kirsty), so index.html aliases its timing lookup to whichever of those
+// two events' scraped data is currently running (or soonest upcoming) —
+// see EVENT_TIMING_ALIAS in index.html — rather than scraping it a third
+// time.
 const SCRAPE_MAIN_EVENTS_BY_CATEGORY = {
   monthly:  ["Ragnarok", "Armageddon", "Dark Omens", "Shadow Invasion", "Hellforge", "Trials of Olympus"],
   weekly:   ["Doomsday", "Arachne", "Ancient's Treasure", "Rise of the Ancients"],

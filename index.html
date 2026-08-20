@@ -132,7 +132,10 @@ const MAIN_CATEGORY_LABEL = { monthly: "Monthly", weekly: "Weekly", biweekly: "B
 // Throne" (which itself already runs simultaneously with "Clash of
 // Kingdoms"). Alias its timing lookup instead of adding a redundant scrape.
 const EVENT_TIMING_ALIAS = {
-  "Thirst for Battle": { category: "biweekly", name: "Clash for the Throne" },
+  "Thirst for Battle": [
+    { category: "biweekly", name: "Clash for the Throne" },
+    { category: "biweekly", name: "Clash of Kingdoms" },
+  ],
 };
 
 function emptyEventEntry() {
@@ -615,10 +618,25 @@ function formatDayLabel(day) {
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
 function getScheduleItem(category, name) {
   const alias = EVENT_TIMING_ALIAS[name];
-  const lookupCategory = alias ? alias.category : category;
-  const lookupName = alias ? alias.name : name;
   const schedule = Store.get("schedule") || { items: [] };
-  return (schedule.items || []).find(i => i.category === lookupCategory && i.name === lookupName) || null;
+  const items = schedule.items || [];
+
+  if (alias) {
+    // Kirsty confirmed "Thirst for Battle" runs at the exact same time as
+    // BOTH "Clash for the Throne" and "Clash of Kingdoms" — check every
+    // aliased target rather than just one, so a scraping hiccup on either
+    // source alone doesn't wrongly show "not running"/no timing. If any
+    // target is currently running, show that. Otherwise show whichever
+    // target's next start is soonest.
+    const targets = alias.map(a => items.find(i => i.category === a.category && i.name === a.name)).filter(Boolean);
+    if (targets.length === 0) return null;
+    const running = targets.find(t => t.running);
+    if (running) return running;
+    const upcoming = targets.filter(t => t.nextStart).sort((a, b) => new Date(a.nextStart).getTime() - new Date(b.nextStart).getTime());
+    return upcoming[0] || targets[0];
+  }
+
+  return items.find(i => i.category === category && i.name === name) || null;
 }
 
 // Sorts event list cards so "Running now" surfaces first, then soonest-
