@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-title" content="69 Event Tracker"/>
+  <title>69 Event Tracker</title>
+  <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #f8fafc; -webkit-tap-highlight-color: transparent; }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    #root { min-height: 100vh; }
+    button { font-family: inherit; cursor: pointer; }
+    input { font-family: inherit; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+const { useState, useRef, useEffect, createContext, useContext } = React;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DAY 1 — App shell, role-based login, bottom nav, local data layer.
+// Mini Events / Main Events / Admin screens are placeholders — built out
+// on later days. The Store API below is the seam that gets swapped for a
+// Google Sheets / Apps Script backend later (Phase 5, per the build plan),
+// so screens should only ever talk to Store, never to localStorage directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── PIN CONFIG ───────────────────────────────────────────────────────────
+// Change these before real use — and again from the Admin tab once it's built.
+// Roles are additive: admin can do everything superior can, superior can do
+// everything viewer can.
+const DEFAULT_PINS = {
+  viewer:   "1111",  // players — read-only: timings, tips, score history
+  superior: "2222",  // + can enter scores for events
+  admin:    "9999",  // + Admin tab: reset PINs, manage divisions, edit tips
+};
+
+const ROLE_RANK = { viewer: 1, superior: 2, admin: 3 };
+function roleAtLeast(role, min) {
+  return !!role && (ROLE_RANK[role] || 0) >= ROLE_RANK[min];
+}
+
+// ─── GOOGLE SHEETS BACKEND ──────────────────────────────────────────────────
+// Paste your Apps Script Web App URL here after deploying it (see the
+// matching AppScript_Backend.js file + setup guide). Until this is filled
+// in, the app runs fine on its own using only the browser's local storage —
+// each device just won't see other devices' data.
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbwRPTohJwtrdEhTjWPKUU2U-wOm07L89QJdItW8zxp5ycCT_XL40jt2N56Kz1t98OH2/exec";
+
+const sheetsEnabled = () => SHEETS_URL && !SHEETS_URL.startsWith("YOUR_");
+
+async function loadFromSheets() {
+  if (!sheetsEnabled()) return null;
+  try {
+    const res = await fetch(SHEETS_URL, { redirect: "follow" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.json();
+  } catch (err) {
+    console.warn("Sheets load failed:", err);
+    return null;
+  }
+}
+
+// Fire-and-forget: Apps Script Web Apps don't return CORS headers on POST,
+// so we use no-cors and never read the response — errors here are network
+// failures only (e.g. offline), not rejections from the script itself.
+async function saveToSheets(data) {
+  if (!sheetsEnabled()) return;
+  try {
+    await fetch(SHEETS_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(data),
+    });
+  } catch (err) {
+    console.warn("Sheets save failed:", err);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STORE — local data layer. Everything reads/writes through here.
+// Backed by localStorage for instant, offline-friendly reads/writes; when
+// SHEETS_URL is configured above, every write also syncs to the shared
+// Google Sheet in the background, and a fresh login pulls the latest shared
+// copy down (see Store.loadFromRemote, called once per login in <App>).
+// ═══════════════════════════════════════════════════════════════════════════
+const STORAGE_KEY = "eventtracker_data_v1";
+
+// The 19 mini events, in the order totalcalculator.org/events.php lists them.
+// Pulled 20 Aug 2026 — if the site adds/renames events later, update this list
+// (Admin-managed event lists are a possible future improvement, not in scope yet).
+const MINI_EVENTS = [
+  "Castle Development", "Scientific Progress", "Capital Challenge",
+  "Blessing of the Gods", "Officer Academy", "Hammer and Anvil",
+  "Tar Mastery", "Regular Decrees", "Battle Training", "Power Points",
+  "Silver Rush", "Wargames", "Gold Rush", "Call of Duty", "Beastslayer",
+  "War Tools", "Crypt Raiders", "The Quest for Chests", "The King's Mercy",
+];
+
+// Main events, in the order totalcalculator.org/events.php lists them.
+// Monthly and Weekly carry a division per occurrence; Biweekly doesn't.
+const MAIN_EVENTS = [
+  { name: "Ragnarok",           category: "monthly",  hasDivisions: true },
+  { name: "Armageddon",         category: "monthly",  hasDivisions: true },
+  { name: "Dark Omens",         category: "monthly",  hasDivisions: true },
+  { name: "Shadow Invasion",    category: "monthly",  hasDivisions: true },
+  { name: "Hellforge",          category: "monthly",  hasDivisions: true },
+  { name: "Trials of Olympus",  category: "monthly",  hasDivisions: true },
+  { name: "Doomsday",           category: "weekly",   hasDivisions: true },
+  { name: "Arachne",            category: "weekly",   hasDivisions: true },
+  { name: "Ancient's Treasure", category: "weekly",   hasDivisions: true },
+  { name: "Rise of the Ancients", category: "weekly", hasDivisions: true },
+  { name: "Clash for the Throne", category: "biweekly", hasDivisions: false },
+  { name: "Clash of Kingdoms",  category: "biweekly", hasDivisions: false },
+];
+const MAIN_EVENT_LOOKUP = Object.fromEntries(MAIN_EVENTS.map(e => [e.name, e]));
+const MAIN_CATEGORY_LABEL = { monthly: "Monthly", weekly: "Weekly", biweekly: "Biweekly" };
+
+function emptyEventEntry() {
+  return { tip: "", history: [] }; // history: [{ id, date, highest, lowest, division? }], newest first, max 3
+}
+
+function buildDefaultMiniEvents() {
+  const out = {};
+  MINI_EVENTS.forEach(name => { out[name] = emptyEventEntry(); });
+  return out;
+}
+
+function buildDefaultMainEvents() {
+  const out = {};
+  MAIN_EVENTS.forEach(e => { out[e.name] = emptyEventEntry(); });
+  return out;
+}
+
+const DEFAULT_DATA = {
+  pins: { ...DEFAULT_PINS },
+  divisions: [],       // e.g. ["X - 9", "VII - 21"] — grows as people use new ones; full add/delete management is an Admin feature
+  miniEvents: buildDefaultMiniEvents(),
+  mainEvents: buildDefaultMainEvents(),
+  schedule: { lastScraped: null, items: [] }, // filled by a future scraper
+  pending: [], // viewer-submitted scores awaiting Superior/Admin approval
+};
+
+// Fill in a possibly-partial data object (from localStorage or Sheets) with
+// defaults for anything missing, so old/incomplete saves never crash newer
+// code that expects a field to exist. Shared by _load() and loadFromRemote().
+function normalizeData(parsed) {
+  const data = { ...DEFAULT_DATA, ...(parsed || {}) };
+  data.miniEvents = { ...buildDefaultMiniEvents(), ...(parsed?.miniEvents || {}) };
+  data.mainEvents = { ...buildDefaultMainEvents(), ...(parsed?.mainEvents || {}) };
+  data.divisions = parsed?.divisions || [];
+  data.pending = parsed?.pending || [];
+  data.pins = { ...DEFAULT_PINS, ...(parsed?.pins || {}) };
+  return data;
+}
+
+const Store = {
+  _cache: null,
+
+  _load() {
+    if (Store._cache) return Store._cache;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      Store._cache = normalizeData(raw ? JSON.parse(raw) : {});
+    } catch {
+      Store._cache = { ...DEFAULT_DATA };
+    }
+    return Store._cache;
+  },
+
+  // Pull the shared copy down from Google Sheets and make it the active
+  // cache (Sheets is treated as the source of truth once configured).
+  // Returns true on success, false if Sheets isn't configured or unreachable
+  // — callers should fall back to whatever's already in localStorage.
+  async loadFromRemote() {
+    if (!sheetsEnabled()) return false;
+    const remote = await loadFromSheets();
+    if (!remote || remote.error) return false;
+    Store._cache = normalizeData(remote);
+    Store._persistLocal();
+    return true;
+  },
+
+  _persistLocal() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Store._cache)); } catch {}
+  },
+
+  _save() {
+    Store._persistLocal();
+    if (sheetsEnabled()) saveToSheets(Store._cache); // fire-and-forget background sync
+  },
+
+  getAll() {
+    return Store._load();
+  },
+
+  get(key) {
+    return Store._load()[key];
+  },
+
+  set(key, value) {
+    const data = Store._load();
+    data[key] = value;
+    Store._save();
+  },
+
+  getPins() {
+    return { ...DEFAULT_PINS, ...(Store._load().pins || {}) };
+  },
+
+  setPin(role, pin) {
+    const data = Store._load();
+    data.pins = { ...Store.getPins(), [role]: pin };
+    Store._save();
+  },
+
+  getMiniEvent(name) {
+    const data = Store._load();
+    return data.miniEvents[name] || emptyEventEntry();
+  },
+
+  setMiniEvent(name, patch) {
+    const data = Store._load();
+    data.miniEvents[name] = { ...emptyEventEntry(), ...data.miniEvents[name], ...patch };
+    Store._save();
+  },
+
+  getMainEvent(name) {
+    const data = Store._load();
+    return data.mainEvents[name] || emptyEventEntry();
+  },
+
+  setMainEvent(name, patch) {
+    const data = Store._load();
+    data.mainEvents[name] = { ...emptyEventEntry(), ...data.mainEvents[name], ...patch };
+    Store._save();
+  },
+
+  // ── Divisions ────────────────────────────────────────────────────────
+  // A simple growing list of division names (e.g. "X - 9"). Anyone entering
+  // a division that isn't in the list yet adds it, so the picker is always
+  // up to date without needing Admin to pre-populate it. Full add/delete
+  // management from Admin is still a later feature.
+  getDivisions() {
+    return Store._load().divisions || [];
+  },
+
+  ensureDivision(name) {
+    const clean = (name || "").trim();
+    if (!clean) return;
+    const data = Store._load();
+    if (!data.divisions.includes(clean)) {
+      data.divisions = [...data.divisions, clean];
+      Store._save();
+    }
+  },
+
+  removeDivision(name) {
+    const data = Store._load();
+    data.divisions = (data.divisions || []).filter(d => d !== name);
+    Store._save();
+  },
+
+  // ── Pending approvals ─────────────────────────────────────────────────
+  // Viewer-submitted scores land here first. Superior/Admin approve (which
+  // files them into the event's history) or reject (which just discards them).
+  getPending() {
+    return Store._load().pending || [];
+  },
+
+  addPending(entry) {
+    const data = Store._load();
+    data.pending = [...(data.pending || []), entry];
+    Store._save();
+  },
+
+  rejectPending(id) {
+    const data = Store._load();
+    data.pending = (data.pending || []).filter(p => p.id !== id);
+    Store._save();
+  },
+
+  approvePending(id) {
+    const data = Store._load();
+    const idx = (data.pending || []).findIndex(p => p.id === id);
+    if (idx === -1) return;
+    const item = data.pending[idx];
+    data.pending.splice(idx, 1);
+    if (item.category === "mini") {
+      const ev = data.miniEvents[item.eventName] || emptyEventEntry();
+      const entry = {
+        id: item.id, date: item.submittedAt,
+        highest: item.highest, lowest: item.lowest, submittedBy: item.submittedBy,
+      };
+      ev.history = [entry, ...ev.history].slice(0, 3);
+      data.miniEvents[item.eventName] = ev;
+    } else if (item.category === "main") {
+      const ev = data.mainEvents[item.eventName] || emptyEventEntry();
+      const entry = {
+        id: item.id, date: item.submittedAt,
+        highest: item.highest, lowest: item.lowest, submittedBy: item.submittedBy,
+        division: item.division || null,
+      };
+      ev.history = [entry, ...ev.history].slice(0, 3);
+      data.mainEvents[item.eventName] = ev;
+      if (item.division) {
+        const clean = item.division.trim();
+        if (clean && !data.divisions.includes(clean)) data.divisions = [...data.divisions, clean];
+      }
+    }
+    Store._save();
+  },
+};
+
+function resolvePin(pin) {
+  const pins = Store.getPins();
+  if (pin === pins.admin)    return "admin";
+  if (pin === pins.superior) return "superior";
+  if (pin === pins.viewer)   return "viewer";
+  return null;
+}
+
+// ─── SESSION ──────────────────────────────────────────────────────────────
+const SESSION_KEY = "eventtracker_session";
+const SESSION_TIMEOUT_HRS = 4;
+
+function loadSession() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(SESSION_KEY));
+    if (!s) return null;
+    const navType = performance?.getEntriesByType?.("navigation")?.[0]?.type;
+    if (navType === "navigate") return null; // fresh URL load always re-prompts
+    if (Date.now() - (s.lastActivity || 0) > SESSION_TIMEOUT_HRS * 3600000) {
+      sessionStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return s;
+  } catch { return null; }
+}
+function saveSession(role) {
+  if (role) sessionStorage.setItem(SESSION_KEY, JSON.stringify({ role, lastActivity: Date.now() }));
+  else sessionStorage.removeItem(SESSION_KEY);
+}
+
+const SessionCtx = createContext(null);
+const useSession = () => useContext(SessionCtx);
+
+// ─── LOGIN SCREEN ─────────────────────────────────────────────────────────
+const LoginScreen = ({ onLogin }) => {
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState(false);
+  const [shake, setShake] = useState(false);
+
+  const submit = (finalPin) => {
+    const role = resolvePin(finalPin);
+    if (role) {
+      saveSession(role);
+      onLogin(role);
+    } else {
+      setError(true);
+      setShake(true);
+      setPin("");
+      setTimeout(() => setShake(false), 500);
+    }
+  };
+
+  const tap = (val) => {
+    setError(false);
+    const next = pin + val;
+    setPin(next);
+    if (next.length === 4) submit(next);
+  };
+  const backspace = () => setPin(p => p.slice(0, -1));
+
+  return (
+    <div style={{
+      minHeight: "100vh", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", background: "#0f172a", padding: 24,
+    }}>
+      <div style={{ fontSize: 40, marginBottom: 4 }}>⚔️</div>
+      <h1 style={{ color: "#f1f5f9", fontSize: 22, margin: "0 0 4px" }}>69 Event Tracker</h1>
+      <p style={{ color: "#94a3b8", fontSize: 13, margin: "0 0 28px" }}>Enter PIN to continue</p>
+
+      <div style={{
+        display: "flex", gap: 12, marginBottom: 28,
+        animation: shake ? "shake 0.4s" : "none",
+      }}>
+        {[0, 1, 2, 3].map(i => (
+          <div key={i} style={{
+            width: 16, height: 16, borderRadius: "50%",
+            background: i < pin.length ? (error ? "#ef4444" : "#38bdf8") : "#334155",
+            transition: "background 0.15s",
+          }} />
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 68px)", gap: 14 }}>
+        {["1","2","3","4","5","6","7","8","9","","0","⌫"].map((k, i) => (
+          k === "" ? <div key={i} /> :
+          <button
+            key={i}
+            onClick={() => k === "⌫" ? backspace() : tap(k)}
+            style={{
+              width: 68, height: 68, borderRadius: "50%", border: "1px solid #334155",
+              background: "#1e293b", color: "#f1f5f9", fontSize: 22, fontWeight: 500,
+            }}
+          >{k}</button>
+        ))}
+      </div>
+
+      {error && <p style={{ color: "#ef4444", fontSize: 13, marginTop: 20 }}>Incorrect PIN — try again</p>}
+
+      <style>{`
+        @keyframes shake {
+          10%, 90% { transform: translateX(-2px); }
+          20%, 80% { transform: translateX(4px); }
+          30%, 50%, 70% { transform: translateX(-8px); }
+          40%, 60% { transform: translateX(8px); }
+        }
+      `}</style>
+    </div>
+  );
+};
+
+// ─── PLACEHOLDER SCREENS (built out on later days) ─────────────────────────
+const PlaceholderScreen = ({ title, subtitle, dayNote }) => (
+  <div style={{ padding: "24px 20px 100px" }}>
+    <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>{title}</h2>
+    <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>{subtitle}</p>
+    <div style={{
+      border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+      color: "#94a3b8", fontSize: 13, textAlign: "center",
+    }}>
+      {dayNote}
+    </div>
+  </div>
+);
+
+// ─── MINI EVENTS ────────────────────────────────────────────────────────────
+function formatDateTime(iso) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+    });
+  } catch { return iso; }
+}
+function formatScore(n) {
+  return Number(n).toLocaleString();
+}
+
+// ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
+function getScheduleItem(category, name) {
+  const schedule = Store.get("schedule") || { items: [] };
+  return (schedule.items || []).find(i => i.category === category && i.name === name) || null;
+}
+
+// Live-updating clock so countdowns tick down on screen instead of showing a
+// fixed date. Each component using this gets its own 1-second interval.
+function useTicker() {
+  const [now, setNow] = React.useState(() => new Date());
+  React.useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return now;
+}
+
+// Formats a millisecond duration the same way totalcalculator.org does
+// ("56m", "4h26m", "1d 4h 56m"), counting down live.
+function formatCountdown(ms) {
+  if (ms == null) return null;
+  if (ms <= 0) return "starting any moment";
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+  if (days > 0) return `${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  if (mins > 0) return `${mins}m ${secs}s`;
+  return `${secs}s`;
+}
+
+const TimingBanner = ({ category, name }) => {
+  const item = getScheduleItem(category, name);
+  const schedule = Store.get("schedule") || {};
+  const now = useTicker();
+
+  if (!item) {
+    return (
+      <div style={{
+        background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 10,
+        padding: "10px 14px", fontSize: 13, color: "#1e40af", marginBottom: 16,
+      }}>
+        ⏱ Timing isn't connected yet — once the schedule sync is set up, this will show what's running now and what's coming up next.
+      </div>
+    );
+  }
+
+  const countdown = item.nextStart ? formatCountdown(new Date(item.nextStart).getTime() - now.getTime()) : null;
+
+  return (
+    <div style={{
+      background: item.running ? "#f0fdf4" : "#eff6ff",
+      border: "1px solid " + (item.running ? "#bbf7d0" : "#bfdbfe"),
+      borderRadius: 10, padding: "10px 14px", fontSize: 13,
+      color: item.running ? "#166534" : "#1e40af", marginBottom: 16,
+    }}>
+      {item.running && (
+        <div style={{ fontWeight: 700, marginBottom: countdown ? 4 : 0 }}>🟢 Running now</div>
+      )}
+      {countdown && (
+        <div>{item.running ? "Next after this in " : "⏱ Starts in "}<strong>{countdown}</strong></div>
+      )}
+      {!item.running && !countdown && <div>Timing not available for this event yet.</div>}
+      {schedule.lastScraped && (
+        <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>Updated {formatDateTime(schedule.lastScraped)}</div>
+      )}
+    </div>
+  );
+};
+
+// Compact one-line, live-ticking timing hint used on the Mini/Main event list cards.
+const TimingHint = ({ sched }) => {
+  const now = useTicker();
+  if (!sched) return null;
+  const countdown = sched.nextStart ? formatCountdown(new Date(sched.nextStart).getTime() - now.getTime()) : null;
+  if (!sched.running && !countdown) return null;
+  return (
+    <div style={{ fontSize: 12, marginTop: 2, color: sched.running ? "#16a34a" : "#2563eb", fontWeight: 600 }}>
+      {sched.running ? "🟢 Running now" : "Starts in " + countdown}
+    </div>
+  );
+};
+
+const cardStyle = {
+  display: "block", width: "100%", textAlign: "left", background: "#fff",
+  border: "1px solid #e2e8f0", borderRadius: 10, padding: "12px 14px",
+};
+
+const MiniEventDetail = ({ name, onBack, onChanged }) => {
+  const session = useSession();
+  const canEnter = roleAtLeast(session.role, "superior"); // direct save, no approval
+  const isViewer = session.role === "viewer";              // submit-for-approval instead
+
+  const [, setTick] = useState(0);
+  const ev = Store.getMiniEvent(name);
+  const myPending = Store.getPending().filter(p => p.category === "mini" && p.eventName === name);
+
+  const [highest, setHighest] = useState("");
+  const [lowest, setLowest] = useState("");
+  const [submitterName, setSubmitterName] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const addScore = () => {
+    if (highest === "" || lowest === "" || isNaN(highest) || isNaN(lowest)) return;
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      date: new Date().toISOString(),
+      highest: Number(highest),
+      lowest: Number(lowest),
+    };
+    const history = [entry, ...ev.history].slice(0, 3);
+    Store.setMiniEvent(name, { history });
+    setHighest(""); setLowest("");
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+    onChanged && onChanged();
+  };
+
+  const submitForApproval = () => {
+    if (!submitterName.trim() || highest === "" || lowest === "" || isNaN(highest) || isNaN(lowest)) return;
+    Store.addPending({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      category: "mini",
+      eventName: name,
+      highest: Number(highest),
+      lowest: Number(lowest),
+      submittedBy: submitterName.trim(),
+      submittedAt: new Date().toISOString(),
+    });
+    setHighest(""); setLowest(""); setSubmitterName("");
+    setSubmitted(true);
+    setTimeout(() => setSubmitted(false), 2000);
+    setTick(t => t + 1);
+    onChanged && onChanged();
+  };
+
+  return (
+    <div style={{ padding: "16px 20px 100px" }}>
+      <button onClick={onBack} style={{
+        background: "none", border: "none", color: "#2563eb", fontSize: 14,
+        padding: "6px 0 14px", fontWeight: 600,
+      }}>&larr; All mini events</button>
+
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 12px" }}>{name}</h2>
+
+      <TimingBanner category="mini" name={name} />
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Hints &amp; tips</div>
+        <div style={{
+          background: "#fff", border: "1px dashed #cbd5e1", borderRadius: 10,
+          padding: 14, fontSize: 13, color: ev.tip ? "#0f172a" : "#94a3b8",
+        }}>
+          {ev.tip || "No tips added yet — these will be added and can be edited from Admin."}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Last 3 scores</div>
+        {ev.history.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#94a3b8", padding: "10px 0" }}>No scores recorded yet.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {ev.history.map(h => (
+              <div key={h.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 12, color: "#64748b" }}>{formatDateTime(h.date)}</span>
+                <span style={{ fontSize: 13 }}>
+                  <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(h.highest)}</span>
+                  {"  "}
+                  <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(h.lowest)}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {canEnter && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Record a score</div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              type="number" inputMode="numeric" placeholder="Highest score" value={highest}
+              onChange={e => setHighest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+            <input
+              type="number" inputMode="numeric" placeholder="Lowest score" value={lowest}
+              onChange={e => setLowest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+          </div>
+          <button
+            onClick={addScore}
+            style={{
+              width: "100%", padding: "11px", borderRadius: 8, border: "none",
+              background: "#0f172a", color: "#fff", fontSize: 14, fontWeight: 600,
+            }}
+          >Save score</button>
+          {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+
+          {myPending.length > 0 && (
+            <div style={{ marginTop: 16, fontSize: 12, color: "#b45309", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px" }}>
+              {myPending.length} submission{myPending.length > 1 ? "s" : ""} awaiting approval for this event — see the Approvals tab.
+            </div>
+          )}
+        </div>
+      )}
+
+      {isViewer && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Submit a score</div>
+          <p style={{ fontSize: 12, color: "#94a3b8", margin: "0 0 10px" }}>
+            Goes to a superior for approval before it's added to the record.
+          </p>
+          <input
+            type="text" placeholder="Your name" value={submitterName}
+            onChange={e => setSubmitterName(e.target.value)}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, marginBottom: 8, boxSizing: "border-box" }}
+          />
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              type="number" inputMode="numeric" placeholder="Highest score" value={highest}
+              onChange={e => setHighest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+            <input
+              type="number" inputMode="numeric" placeholder="Lowest score" value={lowest}
+              onChange={e => setLowest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+          </div>
+          <button
+            onClick={submitForApproval}
+            style={{
+              width: "100%", padding: "11px", borderRadius: 8, border: "none",
+              background: "#2563eb", color: "#fff", fontSize: 14, fontWeight: 600,
+            }}
+          >Submit for approval</button>
+          {submitted && <div style={{ color: "#2563eb", fontSize: 12, marginTop: 8, textAlign: "center" }}>Submitted — thanks! ✓</div>}
+
+          {myPending.length > 0 && (
+            <div style={{ marginTop: 16, fontSize: 12, color: "#64748b" }}>
+              Your pending submissions for this event: {myPending.map(p => `H ${formatScore(p.highest)} / L ${formatScore(p.lowest)}`).join(", ")}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── MAIN EVENTS ────────────────────────────────────────────────────────────
+const DivisionSelect = ({ value, onChange, divisions }) => (
+  <select
+    value={value} onChange={e => onChange(e.target.value)}
+    style={{
+      width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1",
+      fontSize: 14, marginBottom: 8, boxSizing: "border-box", background: "#fff",
+      color: value ? "#0f172a" : "#94a3b8",
+    }}
+  >
+    <option value="">{divisions.length ? "Select division…" : "No divisions added yet"}</option>
+    {divisions.map(d => <option key={d} value={d}>{d}</option>)}
+  </select>
+);
+
+const MainEventDetail = ({ name, onBack, onChanged }) => {
+  const meta = MAIN_EVENT_LOOKUP[name] || { category: "monthly", hasDivisions: true };
+  const session = useSession();
+  const canEnter = roleAtLeast(session.role, "superior");
+  const isViewer = session.role === "viewer";
+
+  const [, setTick] = useState(0);
+  const ev = Store.getMainEvent(name);
+  const divisions = Store.getDivisions();
+  const myPending = Store.getPending().filter(p => p.category === "main" && p.eventName === name);
+
+  const [division, setDivision] = useState("");
+  const [highest, setHighest] = useState("");
+  const [lowest, setLowest] = useState("");
+  const [submitterName, setSubmitterName] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const valid = () => {
+    if (highest === "" || lowest === "" || isNaN(highest) || isNaN(lowest)) return false;
+    if (meta.hasDivisions && !division.trim()) return false;
+    return true;
+  };
+
+  const addScore = () => {
+    if (!valid()) return;
+    if (meta.hasDivisions) Store.ensureDivision(division);
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      date: new Date().toISOString(),
+      highest: Number(highest),
+      lowest: Number(lowest),
+      division: meta.hasDivisions ? division.trim() : null,
+    };
+    const history = [entry, ...ev.history].slice(0, 3);
+    Store.setMainEvent(name, { history });
+    setHighest(""); setLowest(""); setDivision("");
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+    onChanged && onChanged();
+  };
+
+  const submitForApproval = () => {
+    if (!submitterName.trim() || !valid()) return;
+    Store.addPending({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      category: "main",
+      eventName: name,
+      highest: Number(highest),
+      lowest: Number(lowest),
+      division: meta.hasDivisions ? division.trim() : null,
+      submittedBy: submitterName.trim(),
+      submittedAt: new Date().toISOString(),
+    });
+    setHighest(""); setLowest(""); setDivision(""); setSubmitterName("");
+    setSubmitted(true);
+    setTimeout(() => setSubmitted(false), 2000);
+    setTick(t => t + 1);
+    onChanged && onChanged();
+  };
+
+  return (
+    <div style={{ padding: "16px 20px 100px" }}>
+      <button onClick={onBack} style={{
+        background: "none", border: "none", color: "#2563eb", fontSize: 14,
+        padding: "6px 0 14px", fontWeight: 600,
+      }}>&larr; All main events</button>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <h2 style={{ fontSize: 20, color: "#0f172a", margin: 0 }}>{name}</h2>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+          {MAIN_CATEGORY_LABEL[meta.category]}
+        </span>
+      </div>
+      {!meta.hasDivisions && (
+        <p style={{ fontSize: 12, color: "#94a3b8", margin: "0 0 12px" }}>No divisions for this event.</p>
+      )}
+      {meta.hasDivisions && <div style={{ marginBottom: 12 }} />}
+
+      <TimingBanner category={meta.category} name={name} />
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Hints &amp; tips</div>
+        <div style={{
+          background: "#fff", border: "1px dashed #cbd5e1", borderRadius: 10,
+          padding: 14, fontSize: 13, color: ev.tip ? "#0f172a" : "#94a3b8",
+        }}>
+          {ev.tip || "No tips added yet — these will be added and can be edited from Admin."}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Last 3 scores</div>
+        {ev.history.length === 0 ? (
+          <div style={{ fontSize: 13, color: "#94a3b8", padding: "10px 0" }}>No scores recorded yet.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {ev.history.map(h => (
+              <div key={h.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 12, color: "#64748b" }}>
+                  {formatDateTime(h.date)}
+                  {h.division ? ` · Division ${h.division}` : ""}
+                </span>
+                <span style={{ fontSize: 13 }}>
+                  <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(h.highest)}</span>
+                  {"  "}
+                  <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(h.lowest)}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {canEnter && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Record a score</div>
+          {meta.hasDivisions && (
+            <DivisionSelect value={division} onChange={setDivision} divisions={divisions} />
+          )}
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              type="number" inputMode="numeric" placeholder="Highest score" value={highest}
+              onChange={e => setHighest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+            <input
+              type="number" inputMode="numeric" placeholder="Lowest score" value={lowest}
+              onChange={e => setLowest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+          </div>
+          <button
+            onClick={addScore}
+            style={{
+              width: "100%", padding: "11px", borderRadius: 8, border: "none",
+              background: "#0f172a", color: "#fff", fontSize: 14, fontWeight: 600,
+            }}
+          >Save score</button>
+          {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+
+          {myPending.length > 0 && (
+            <div style={{ marginTop: 16, fontSize: 12, color: "#b45309", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px" }}>
+              {myPending.length} submission{myPending.length > 1 ? "s" : ""} awaiting approval for this event — see the Approvals tab.
+            </div>
+          )}
+        </div>
+      )}
+
+      {isViewer && (
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 6 }}>Submit a score</div>
+          <p style={{ fontSize: 12, color: "#94a3b8", margin: "0 0 10px" }}>
+            Goes to a superior for approval before it's added to the record.
+          </p>
+          <input
+            type="text" placeholder="Your name" value={submitterName}
+            onChange={e => setSubmitterName(e.target.value)}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, marginBottom: 8, boxSizing: "border-box" }}
+          />
+          {meta.hasDivisions && (
+            <DivisionSelect value={division} onChange={setDivision} divisions={divisions} />
+          )}
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              type="number" inputMode="numeric" placeholder="Highest score" value={highest}
+              onChange={e => setHighest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+            <input
+              type="number" inputMode="numeric" placeholder="Lowest score" value={lowest}
+              onChange={e => setLowest(e.target.value)}
+              style={{ flex: 1, minWidth: 0, padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 }}
+            />
+          </div>
+          <button
+            onClick={submitForApproval}
+            style={{
+              width: "100%", padding: "11px", borderRadius: 8, border: "none",
+              background: "#2563eb", color: "#fff", fontSize: 14, fontWeight: 600,
+            }}
+          >Submit for approval</button>
+          {submitted && <div style={{ color: "#2563eb", fontSize: 12, marginTop: 8, textAlign: "center" }}>Submitted — thanks! ✓</div>}
+
+          {myPending.length > 0 && (
+            <div style={{ marginTop: 16, fontSize: 12, color: "#64748b" }}>
+              Your pending submissions for this event: {myPending.map(p => `${p.division ? "Div " + p.division + ": " : ""}H ${formatScore(p.highest)} / L ${formatScore(p.lowest)}`).join(", ")}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MAIN_CATEGORIES = ["monthly", "weekly", "biweekly"];
+
+const MainEventsScreen = () => {
+  const session = useSession();
+  const canSeePending = roleAtLeast(session.role, "superior");
+  const [selected, setSelected] = useState(null);
+  const [, setTick] = useState(0);
+
+  if (selected) {
+    return (
+      <MainEventDetail
+        name={selected}
+        onBack={() => { setSelected(null); setTick(t => t + 1); }}
+        onChanged={() => setTick(t => t + 1)}
+      />
+    );
+  }
+
+  const pending = Store.getPending();
+
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Main Events</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+        Monthly &amp; Weekly include a division per occurrence — Biweekly doesn't.
+      </p>
+      {MAIN_CATEGORIES.map(cat => (
+        <div key={cat} style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 8 }}>
+            {MAIN_CATEGORY_LABEL[cat]}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {MAIN_EVENTS.filter(e => e.category === cat).map(e => {
+              const ev = Store.getMainEvent(e.name);
+              const latest = ev.history[0];
+              const pendingCount = canSeePending ? pending.filter(p => p.category === "main" && p.eventName === e.name).length : 0;
+              const sched = getScheduleItem(e.category, e.name);
+              return (
+                <button key={e.name} onClick={() => setSelected(e.name)} style={cardStyle}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{e.name}</div>
+                    {pendingCount > 0 && (
+                      <span style={{ fontSize: 11, fontWeight: 600, color: "#b45309", background: "#fef3c7", padding: "2px 8px", borderRadius: 999 }}>
+                        {pendingCount} pending
+                      </span>
+                    )}
+                  </div>
+                  <TimingHint sched={sched} />
+                  <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                    {latest
+                      ? <>
+                          {latest.division ? `Div ${latest.division} — ` : ""}
+                          <span style={{ color: "#16a34a" }}>H {formatScore(latest.highest)}</span> / <span style={{ color: "#dc2626" }}>L {formatScore(latest.lowest)}</span>
+                        </>
+                      : "No scores recorded yet"}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ─── APPROVALS (Superior + Admin) ──────────────────────────────────────────
+const ApprovalsScreen = () => {
+  const [, setTick] = useState(0);
+  const pending = Store.getPending();
+
+  const approve = (id) => { Store.approvePending(id); setTick(t => t + 1); };
+  const reject = (id) => { Store.rejectPending(id); setTick(t => t + 1); };
+
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Approvals</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+        Scores submitted by players, waiting for review.
+      </p>
+
+      {pending.length === 0 ? (
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>Nothing pending — all caught up.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {pending.map(p => (
+            <div key={p.id} style={cardStyle}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{p.eventName}</div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                  {p.category === "mini" ? "Mini" : MAIN_CATEGORY_LABEL[MAIN_EVENT_LOOKUP[p.eventName]?.category] || "Main"}
+                </span>
+              </div>
+              <div style={{ fontSize: 12, color: "#64748b", margin: "2px 0 8px" }}>
+                Submitted by {p.submittedBy} · {formatDateTime(p.submittedAt)}
+                {p.division ? ` · Division ${p.division}` : ""}
+              </div>
+              <div style={{ fontSize: 13, marginBottom: 10 }}>
+                <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(p.highest)}</span>
+                {"  "}
+                <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(p.lowest)}</span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => approve(p.id)}
+                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "#16a34a", color: "#fff", fontSize: 13, fontWeight: 600 }}
+                >Approve</button>
+                <button
+                  onClick={() => reject(p.id)}
+                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "1px solid #fca5a5", background: "#fff", color: "#dc2626", fontSize: 13, fontWeight: 600 }}
+                >Reject</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MiniEventsScreen = () => {
+  const session = useSession();
+  const canSeePending = roleAtLeast(session.role, "superior");
+  const [selected, setSelected] = useState(null);
+  const [, setTick] = useState(0);
+
+  if (selected) {
+    return (
+      <MiniEventDetail
+        name={selected}
+        onBack={() => { setSelected(null); setTick(t => t + 1); }}
+        onChanged={() => setTick(t => t + 1)}
+      />
+    );
+  }
+
+  const pending = Store.getPending();
+
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Mini Events</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+        19 short cross-kingdom league events — tap one for timing, tips &amp; scores.
+      </p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {MINI_EVENTS.map(name => {
+          const ev = Store.getMiniEvent(name);
+          const latest = ev.history[0];
+          const pendingCount = canSeePending ? pending.filter(p => p.category === "mini" && p.eventName === name).length : 0;
+          const sched = getScheduleItem("mini", name);
+          return (
+            <button key={name} onClick={() => setSelected(name)} style={cardStyle}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{name}</div>
+                {pendingCount > 0 && (
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#b45309", background: "#fef3c7", padding: "2px 8px", borderRadius: 999 }}>
+                    {pendingCount} pending
+                  </span>
+                )}
+              </div>
+              <TimingHint sched={sched} />
+              <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                {latest
+                  ? <>Last: <span style={{ color: "#16a34a" }}>H {formatScore(latest.highest)}</span> / <span style={{ color: "#dc2626" }}>L {formatScore(latest.lowest)}</span></>
+                  : "No scores recorded yet"}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// ─── ADMIN ──────────────────────────────────────────────────────────────────
+const sectionLabelStyle = { fontSize: 12, fontWeight: 700, color: "#64748b", textTransform: "uppercase", marginBottom: 8 };
+const adminInputStyle = { flex: 1, minWidth: 0, padding: "9px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 };
+const adminButtonStyle = { padding: "9px 16px", borderRadius: 8, border: "none", background: "#0f172a", color: "#fff", fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" };
+
+const PIN_ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
+
+const AdminPinRow = ({ role }) => {
+  const [value, setValue] = useState(Store.getPins()[role]);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(false);
+
+  const save = () => {
+    const clean = (value || "").trim();
+    if (!/^\d{4}$/.test(clean)) { setError(true); setTimeout(() => setError(false), 1500); return; }
+    Store.setPin(role, clean);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginBottom: 4 }}>{PIN_ROLE_LABEL[role]} PIN</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={value} onChange={e => setValue(e.target.value.replace(/\D/g, "").slice(0, 4))}
+          inputMode="numeric" maxLength={4} style={{ ...adminInputStyle, letterSpacing: 2 }}
+        />
+        <button onClick={save} style={adminButtonStyle}>Save</button>
+      </div>
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 4 }}>Saved ✓</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 4 }}>PIN must be exactly 4 digits</div>}
+    </div>
+  );
+};
+
+const AdminDivisions = () => {
+  const [, setTick] = useState(0);
+  const [newDiv, setNewDiv] = useState("");
+  const divisions = Store.getDivisions();
+
+  const add = () => {
+    const clean = newDiv.trim();
+    if (!clean) return;
+    Store.ensureDivision(clean);
+    setNewDiv("");
+    setTick(t => t + 1);
+  };
+  const remove = (name) => {
+    Store.removeDivision(name);
+    setTick(t => t + 1);
+  };
+
+  return (
+    <div>
+      {divisions.length === 0 ? (
+        <p style={{ fontSize: 13, color: "#94a3b8", margin: "0 0 12px" }}>
+          No divisions yet — add one below. Monthly/Weekly score entry won't work until at least one exists.
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+          {divisions.map(d => (
+            <span key={d} style={{
+              display: "flex", alignItems: "center", gap: 6, background: "#f1f5f9",
+              border: "1px solid #e2e8f0", borderRadius: 999, padding: "5px 6px 5px 12px", fontSize: 13,
+            }}>
+              {d}
+              <button
+                onClick={() => remove(d)}
+                aria-label={`Remove ${d}`}
+                style={{ background: "#e2e8f0", border: "none", color: "#dc2626", fontSize: 13, lineHeight: 1, width: 18, height: 18, borderRadius: "50%" }}
+              >×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={newDiv} onChange={e => setNewDiv(e.target.value)} placeholder="New division (e.g. X - 9)"
+          style={adminInputStyle}
+        />
+        <button onClick={add} style={adminButtonStyle}>Add</button>
+      </div>
+    </div>
+  );
+};
+
+const TIP_CATEGORY_OPTIONS = [
+  { key: "mini", label: "Mini Events" },
+  { key: "monthly", label: "Monthly" },
+  { key: "weekly", label: "Weekly" },
+  { key: "biweekly", label: "Biweekly" },
+];
+
+function eventsForTipCategory(key) {
+  if (key === "mini") return MINI_EVENTS.map(n => ({ name: n, kind: "mini" }));
+  return MAIN_EVENTS.filter(e => e.category === key).map(e => ({ name: e.name, kind: "main" }));
+}
+
+const AdminTips = () => {
+  const [category, setCategory] = useState("mini");
+  const options = eventsForTipCategory(category);
+  const [eventName, setEventName] = useState(options[0]?.name || "");
+  const kind = category === "mini" ? "mini" : "main";
+  const [tipDraft, setTipDraft] = useState("");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    const opts = eventsForTipCategory(category);
+    setEventName(opts[0]?.name || "");
+  }, [category]);
+
+  useEffect(() => {
+    if (!eventName) { setTipDraft(""); return; }
+    const current = kind === "mini" ? Store.getMiniEvent(eventName) : Store.getMainEvent(eventName);
+    setTipDraft(current.tip || "");
+  }, [eventName, kind]);
+
+  const save = () => {
+    if (!eventName) return;
+    if (kind === "mini") Store.setMiniEvent(eventName, { tip: tipDraft });
+    else Store.setMainEvent(eventName, { tip: tipDraft });
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <select
+          value={category} onChange={e => setCategory(e.target.value)}
+          style={{ ...adminInputStyle, flex: "0 0 130px" }}
+        >
+          {TIP_CATEGORY_OPTIONS.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+        </select>
+        <select
+          value={eventName} onChange={e => setEventName(e.target.value)}
+          style={adminInputStyle}
+        >
+          {options.map(o => <option key={o.name} value={o.name}>{o.name}</option>)}
+        </select>
+      </div>
+      <textarea
+        value={tipDraft} onChange={e => setTipDraft(e.target.value)}
+        placeholder="Hints and tips for this event..."
+        rows={4}
+        style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box", resize: "vertical", marginBottom: 8 }}
+      />
+      <button onClick={save} style={{ ...adminButtonStyle, width: "100%" }}>Save tip</button>
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+    </div>
+  );
+};
+
+const AdminScreen = () => {
+  const session = useSession();
+  if (!roleAtLeast(session.role, "admin")) {
+    return (
+      <div style={{ padding: "40px 20px", textAlign: "center", color: "#64748b" }}>
+        Admin access required.
+      </div>
+    );
+  }
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Admin</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>
+        Passwords, divisions &amp; event tips.
+      </p>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>Passwords</div>
+        <AdminPinRow role="viewer" />
+        <AdminPinRow role="superior" />
+        <AdminPinRow role="admin" />
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>Divisions</div>
+        <AdminDivisions />
+      </div>
+
+      <div>
+        <div style={sectionLabelStyle}>Event tips</div>
+        <AdminTips />
+      </div>
+    </div>
+  );
+};
+
+// ─── APP SHELL ──────────────────────────────────────────────────────────────
+const TABS = [
+  { key: "mini", label: "Mini Events", icon: "⏱️", minRole: "viewer" },
+  { key: "main", label: "Main Events", icon: "🏆", minRole: "viewer" },
+  { key: "approvals", label: "Approvals", icon: "📥", minRole: "superior" },
+  { key: "admin", label: "Admin", icon: "⚙️", minRole: "admin" },
+];
+
+const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
+
+const AppShell = ({ role, onLogout }) => {
+  const [tab, setTab] = useState("mini");
+  const visibleTabs = TABS.filter(t => roleAtLeast(role, t.minRole));
+  const pendingCount = roleAtLeast(role, "superior") ? Store.getPending().length : 0;
+
+  return (
+    <SessionCtx.Provider value={{ role }}>
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+        <header style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "14px 18px", background: "#0f172a", color: "#f1f5f9",
+        }}>
+          <div style={{ fontWeight: 600, fontSize: 16 }}>69 Event Tracker</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{
+              fontSize: 11, background: "#1e293b", color: "#94a3b8",
+              padding: "3px 9px", borderRadius: 999,
+            }}>{ROLE_LABEL[role]}</span>
+            <button
+              onClick={onLogout}
+              style={{
+                background: "none", border: "1px solid #334155", color: "#94a3b8",
+                borderRadius: 6, padding: "4px 10px", fontSize: 12,
+              }}
+            >Log out</button>
+          </div>
+        </header>
+
+        <main style={{ flex: 1, overflowY: "auto" }}>
+          {tab === "mini" && <MiniEventsScreen />}
+          {tab === "main" && <MainEventsScreen />}
+          {tab === "approvals" && <ApprovalsScreen />}
+          {tab === "admin" && <AdminScreen />}
+        </main>
+
+        <nav style={{
+          position: "fixed", bottom: 0, left: 0, right: 0,
+          display: "flex", background: "#fff", borderTop: "1px solid #e2e8f0",
+          paddingBottom: "env(safe-area-inset-bottom)",
+        }}>
+          {visibleTabs.map(t => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              style={{
+                position: "relative", flex: 1, border: "none", background: "none", padding: "10px 4px 8px",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                color: tab === t.key ? "#0f172a" : "#94a3b8",
+                fontWeight: tab === t.key ? 600 : 400,
+              }}
+            >
+              <span style={{ position: "relative", fontSize: 20 }}>
+                {t.icon}
+                {t.key === "approvals" && pendingCount > 0 && (
+                  <span style={{
+                    position: "absolute", top: -4, right: -10, background: "#dc2626", color: "#fff",
+                    fontSize: 9, fontWeight: 700, borderRadius: 999, padding: "1px 5px", lineHeight: "12px",
+                  }}>{pendingCount}</span>
+                )}
+              </span>
+              <span style={{ fontSize: 11 }}>{t.label}</span>
+            </button>
+          ))}
+        </nav>
+      </div>
+    </SessionCtx.Provider>
+  );
+};
+
+const LoadingScreen = ({ text }) => (
+  <div style={{
+    minHeight: "100vh", display: "flex", flexDirection: "column",
+    alignItems: "center", justifyContent: "center", background: "#f8fafc", gap: 12,
+  }}>
+    <div style={{ fontSize: 32 }}>⏳</div>
+    <div style={{ color: "#64748b", fontSize: 14 }}>{text}</div>
+  </div>
+);
+
+// ─── ROOT ───────────────────────────────────────────────────────────────────
+const App = () => {
+  const [session, setSession] = useState(() => loadSession());
+  // No Sheets configured yet → nothing to wait for, start ready (matches the
+  // original instant local-only behaviour). Once SHEETS_URL is set, every
+  // fresh login pulls the shared copy down before the app is usable.
+  const [dataReady, setDataReady] = useState(!sheetsEnabled());
+  const [syncError, setSyncError] = useState(false);
+
+  useEffect(() => {
+    if (!session) return;
+    const bump = () => saveSession(session.role);
+    window.addEventListener("click", bump);
+    window.addEventListener("keydown", bump);
+    return () => {
+      window.removeEventListener("click", bump);
+      window.removeEventListener("keydown", bump);
+    };
+  }, [session]);
+
+  useEffect(() => {
+    if (!session || !sheetsEnabled()) return;
+    let cancelled = false;
+    setDataReady(false);
+    setSyncError(false);
+    Store.loadFromRemote().then(ok => {
+      if (cancelled) return;
+      if (!ok) setSyncError(true);
+      setDataReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [session]);
+
+  const handleLogout = () => {
+    saveSession(null);
+    setSession(null);
+    setDataReady(!sheetsEnabled());
+    setSyncError(false);
+  };
+
+  if (!session) {
+    return <LoginScreen onLogin={(role) => setSession({ role })} />;
+  }
+
+  if (!dataReady) {
+    return <LoadingScreen text="Loading shared data…" />;
+  }
+
+  return (
+    <React.Fragment>
+      {syncError && (
+        <div style={{ background: "#fef3c7", color: "#92400e", fontSize: 12, textAlign: "center", padding: "6px 12px" }}>
+          Couldn't reach the shared data — showing this device's local copy instead.
+        </div>
+      )}
+      <AppShell role={session.role} onLogout={handleLogout} />
+    </React.Fragment>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
