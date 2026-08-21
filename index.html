@@ -607,12 +607,15 @@ function formatCompact(value) {
   return num.toLocaleString();
 }
 // Epic "Day" field is often just a plain number ("1", "2") — show it as
-// "1 day" / "2 days" instead of a bare digit. Anything already worded
-// (e.g. "Day 1-2", "Final day") is left exactly as typed.
+// "Day - 1" / "Day - 2" instead of a bare digit (Kirsty's exact requested
+// format, 2026-08-20 — replaced the earlier "1 day"/"2 days" wording).
+// Anything already worded (e.g. "Day 1-2", "Final day") is left exactly as
+// typed, so free-form entries like Trials of Olympus's "Day 1"/"Day 2"
+// markers still pass through unchanged.
 function formatDayLabel(day) {
   const s = (day || "").trim();
   if (!s) return "";
-  return /^\d+$/.test(s) ? `${s} day${s === "1" ? "" : "s"}` : s;
+  return /^\d+$/.test(s) ? `Day - ${s}` : s;
 }
 
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
