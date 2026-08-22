@@ -38,12 +38,15 @@ const { useState, useRef, useEffect, createContext, useContext } = React;
 // Roles are additive: admin can do everything superior can, superior can do
 // everything viewer can.
 const DEFAULT_PINS = {
-  viewer:   "1111",  // players — read-only: timings, tips, score history
-  superior: "2222",  // + can enter scores for events
-  admin:    "9999",  // + Admin tab: reset PINs, manage divisions, edit tips
+  viewer:     "1111",    // players — read-only: timings, tips, score history
+  superior:   "2222",    // + can enter scores for events
+  admin:      "9999",    // + Admin tab: reset PINs, manage divisions, edit tips
+  superadmin: "555555",  // + Data & backup: export/download/restore — Kirsty only (2026-08-22).
+                          // Deliberately 6 digits (every other PIN is 4) so the login pad can
+                          // tell them apart. Change this before real use, same as the others.
 };
 
-const ROLE_RANK = { viewer: 1, superior: 2, admin: 3 };
+const ROLE_RANK = { viewer: 1, superior: 2, admin: 3, superadmin: 4 };
 function roleAtLeast(role, min) {
   return !!role && (ROLE_RANK[role] || 0) >= ROLE_RANK[min];
 }
@@ -220,6 +223,16 @@ const Store = {
 
   getAll() {
     return Store._load();
+  },
+
+  // Full-data restore from a backup file — replaces everything (Kirsty's
+  // choice, 2026-08-22: "Replace everything") rather than merging with
+  // what's currently stored. Runs through the same normalizeData() as a
+  // fresh load, so a backup missing newer fields still works instead of
+  // crashing, and the replacement syncs to Sheets like any other save.
+  replaceAll(newData) {
+    Store._cache = normalizeData(newData);
+    Store._save();
   },
 
   get(key) {
@@ -446,9 +459,10 @@ function parseEpicPaste(text) {
 
 function resolvePin(pin) {
   const pins = Store.getPins();
-  if (pin === pins.admin)    return "admin";
-  if (pin === pins.superior) return "superior";
-  if (pin === pins.viewer)   return "viewer";
+  if (pin === pins.superadmin) return "superadmin";
+  if (pin === pins.admin)      return "admin";
+  if (pin === pins.superior)   return "superior";
+  if (pin === pins.viewer)     return "viewer";
   return null;
 }
 
@@ -496,11 +510,21 @@ const LoginScreen = ({ onLogin }) => {
     }
   };
 
+  // Every role but Super Admin uses a 4-digit PIN and auto-submits the moment
+  // 4 digits are entered, same as before. Super Admin's PIN is 6 digits
+  // (2026-08-22, Kirsty-only), so if 4 digits don't match anything, we don't
+  // error yet — we keep accepting up to 6 in case a longer PIN is being
+  // typed, and only check/error at that point. (Pick a Super Admin PIN that
+  // doesn't start with any 4-digit PIN's exact digits, or the 4-digit login
+  // will fire first.)
+  const MAX_PIN_LENGTH = 6;
   const tap = (val) => {
+    if (pin.length >= MAX_PIN_LENGTH) return;
     setError(false);
     const next = pin + val;
     setPin(next);
-    if (next.length === 4) submit(next);
+    if (next.length === 4 && resolvePin(next)) submit(next);
+    else if (next.length === MAX_PIN_LENGTH) submit(next);
   };
   const backspace = () => setPin(p => p.slice(0, -1));
 
@@ -517,7 +541,7 @@ const LoginScreen = ({ onLogin }) => {
         display: "flex", gap: 12, marginBottom: 28,
         animation: shake ? "shake 0.4s" : "none",
       }}>
-        {[0, 1, 2, 3].map(i => (
+        {Array.from({ length: Math.max(pin.length, 4) }).map((_, i) => (
           <div key={i} style={{
             width: 16, height: 16, borderRadius: "50%",
             background: i < pin.length ? (error ? "#ef4444" : "#38bdf8") : "#334155",
@@ -606,6 +630,20 @@ function formatCompact(value) {
   }
   return num.toLocaleString();
 }
+// Total Health / Total Strength for an Epic monster are always Health×Quantity
+// and Strength×Quantity — calculated automatically rather than typed in or
+// trusted from a spreadsheet paste (Kirsty's request, 2026-08-22: "the
+// calculation should always override the input"). Applies everywhere,
+// including monsters entered/pasted before this existed — the stored
+// totalHealth/totalStrength fields are never read for display; only Health,
+// Strength and Quantity feed the calculation. Blank or non-numeric inputs
+// calculate to 0 rather than being left blank.
+function computeMonsterTotal(base, quantity) {
+  const b = Number(String(base ?? "").replace(/,/g, "").trim());
+  const q = Number(String(quantity ?? "").replace(/,/g, "").trim());
+  if (!isFinite(b) || !isFinite(q)) return "0";
+  return String(b * q);
+}
 // Epic "Day" field is often just a plain number ("1", "2") — show it as
 // "Day - 1" / "Day - 2" instead of a bare digit (Kirsty's exact requested
 // format, 2026-08-20 — replaced the earlier "1 day"/"2 days" wording).
@@ -616,6 +654,57 @@ function formatDayLabel(day) {
   const s = (day || "").trim();
   if (!s) return "";
   return /^\d+$/.test(s) ? `Day - ${s}` : s;
+}
+
+// ─── EXPORT & BACKUP ────────────────────────────────────────────────────────
+// Kirsty's request, 2026-08-22: export all epics/monsters as a spreadsheet,
+// and a full-app backup/restore. Runs entirely in her own browser — no
+// backend involved, just a file download / file picker.
+function fileDateStamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function downloadTextFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvEscape(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// One row per monster, epic-level fields repeated on every row — same column
+// order as the paste-in format, plus the epic's own name/event/day/etc. and
+// the calculated Total Health/Strength, so the export matches what's shown
+// on screen even for epics entered before that calculation existed.
+const EPICS_EXPORT_HEADERS = [
+  "Epic", "Event", "Day", "Captain/Hero", "# Captains", "Meat", "Chests",
+  "Order", "Name", "Type 1", "Type 2", "Type 3", "Strength Against", "% Strength Against",
+  "Initiative", "Strength", "Health", "Leadership", "Quantity", "Total Health", "Total Strength",
+];
+function buildEpicsCSV(epics) {
+  const rows = [EPICS_EXPORT_HEADERS];
+  (epics || []).forEach(ep => {
+    (ep.monsters || []).forEach(m => {
+      rows.push([
+        ep.name, ep.event, ep.day, ep.captainHero, ep.numCaptains, ep.meat, ep.chests,
+        m.order, m.name, m.type1, m.type2, m.type3, m.strengthAgainst, m.pctStrengthAgainst,
+        m.initiative, m.strength, m.health, m.leadership, m.quantity,
+        computeMonsterTotal(m.health, m.quantity), computeMonsterTotal(m.strength, m.quantity),
+      ]);
+    });
+  });
+  return rows.map(r => r.map(csvEscape).join(",")).join("\r\n");
 }
 
 // ─── TIMING (from the Apps Script scraper's cache) ─────────────────────────
@@ -1156,8 +1245,8 @@ const EpicMonsterCard = ({ m }) => {
         {stat("Health", m.health)}
         {stat("Leadership", m.leadership)}
         {stat("Quantity", m.quantity)}
-        {stat("Total Health", m.totalHealth)}
-        {stat("Total Strength", m.totalStrength)}
+        {stat("Total Health", computeMonsterTotal(m.health, m.quantity))}
+        {stat("Total Strength", computeMonsterTotal(m.strength, m.quantity))}
       </div>
     </div>
   );
@@ -1731,16 +1820,20 @@ const sectionLabelStyle = { fontSize: 12, fontWeight: 700, color: "#64748b", tex
 const adminInputStyle = { flex: 1, minWidth: 0, padding: "9px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14 };
 const adminButtonStyle = { padding: "9px 16px", borderRadius: 8, border: "none", background: "#0f172a", color: "#fff", fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" };
 
-const PIN_ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
+const PIN_ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin", superadmin: "Super Admin" };
+// Every role uses a 4-digit PIN except Super Admin, which is deliberately
+// longer (2026-08-22) so the login pad can tell it apart from the rest.
+const PIN_LENGTH = { viewer: 4, superior: 4, admin: 4, superadmin: 6 };
 
 const AdminPinRow = ({ role }) => {
+  const len = PIN_LENGTH[role] || 4;
   const [value, setValue] = useState(Store.getPins()[role]);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(false);
 
   const save = () => {
     const clean = (value || "").trim();
-    if (!/^\d{4}$/.test(clean)) { setError(true); setTimeout(() => setError(false), 1500); return; }
+    if (!new RegExp(`^\\d{${len}}$`).test(clean)) { setError(true); setTimeout(() => setError(false), 1500); return; }
     Store.setPin(role, clean);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
@@ -1751,25 +1844,31 @@ const AdminPinRow = ({ role }) => {
       <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginBottom: 4 }}>{PIN_ROLE_LABEL[role]} PIN</div>
       <div style={{ display: "flex", gap: 8 }}>
         <input
-          value={value} onChange={e => setValue(e.target.value.replace(/\D/g, "").slice(0, 4))}
-          inputMode="numeric" maxLength={4} style={{ ...adminInputStyle, letterSpacing: 2 }}
+          value={value} onChange={e => setValue(e.target.value.replace(/\D/g, "").slice(0, len))}
+          inputMode="numeric" maxLength={len} style={{ ...adminInputStyle, letterSpacing: 2 }}
         />
         <button onClick={save} style={adminButtonStyle}>Save</button>
       </div>
       {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 4 }}>Saved ✓</div>}
-      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 4 }}>PIN must be exactly 4 digits</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 4 }}>PIN must be exactly {len} digits</div>}
     </div>
   );
 };
 
 // Pick which role's PIN to change, then edit just that one — avoids showing
-// all three PINs at once.
+// all of them at once. Super Admin's PIN only appears in this picker at all
+// when the person editing is themselves logged in as Super Admin (Kirsty's
+// request, 2026-08-22) — a regular Admin can't see or change it.
 const AdminPasswords = () => {
+  const session = useSession();
+  const roles = roleAtLeast(session.role, "superadmin")
+    ? ["viewer", "superior", "admin", "superadmin"]
+    : ["viewer", "superior", "admin"];
   const [role, setRole] = useState("viewer");
   return (
     <div>
       <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-        {["viewer", "superior", "admin"].map(r => (
+        {roles.map(r => (
           <button
             key={r}
             onClick={() => setRole(r)}
@@ -1965,18 +2064,40 @@ function emptyMonsterRow() {
   return m;
 }
 
+// Total Health / Total Strength are shown as calculated, non-editable boxes —
+// Health×Quantity and Strength×Quantity — rather than input fields. A paste
+// from Kirsty's spreadsheet can still fill in a Total Health/Strength column
+// (parseEpicPaste doesn't need to change), it's just ignored: these two boxes
+// always display the live calculation instead of whatever came in.
+const COMPUTED_TOTAL_SOURCE = { totalHealth: "health", totalStrength: "strength" };
+
 const MonsterFieldGrid = ({ monster, onChange }) => (
   <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-    {MONSTER_FIELD_DEFS.map(f => (
-      <div key={f.key} style={{ flex: `0 0 ${f.width}px`, minWidth: f.width }}>
-        <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2, textTransform: "uppercase", fontWeight: 600 }}>{f.label}</div>
-        <input
-          value={monster[f.key] || ""}
-          onChange={e => onChange(f.key, e.target.value)}
-          style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: "1px solid #cbd5e1", fontSize: 13, boxSizing: "border-box" }}
-        />
-      </div>
-    ))}
+    {MONSTER_FIELD_DEFS.map(f => {
+      const sourceKey = COMPUTED_TOTAL_SOURCE[f.key];
+      return (
+        <div key={f.key} style={{ flex: `0 0 ${f.width}px`, minWidth: f.width }}>
+          <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2, textTransform: "uppercase", fontWeight: 600 }}>{f.label}</div>
+          {sourceKey ? (
+            <div
+              title="Calculated automatically — Health/Strength × Quantity"
+              style={{
+                width: "100%", padding: "6px 8px", borderRadius: 6, border: "1px solid #e2e8f0",
+                fontSize: 13, boxSizing: "border-box", background: "#f1f5f9", color: "#475569",
+              }}
+            >
+              {formatMaybeNum(computeMonsterTotal(monster[sourceKey], monster.quantity))}
+            </div>
+          ) : (
+            <input
+              value={monster[f.key] || ""}
+              onChange={e => onChange(f.key, e.target.value)}
+              style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: "1px solid #cbd5e1", fontSize: 13, boxSizing: "border-box" }}
+            />
+          )}
+        </div>
+      );
+    })}
   </div>
 );
 
@@ -2041,7 +2162,15 @@ const AdminEpics = () => {
     setError("");
     const cleanName = epicName.trim();
     if (!cleanName) { setError("Give this epic a name first."); return; }
-    const validMonsters = monsters.filter(m => (m.name || "").trim());
+    const validMonsters = monsters
+      .filter(m => (m.name || "").trim())
+      // Total Health/Strength are always recalculated on save, overriding
+      // whatever was typed or pasted in for those two fields.
+      .map(m => ({
+        ...m,
+        totalHealth: computeMonsterTotal(m.health, m.quantity),
+        totalStrength: computeMonsterTotal(m.strength, m.quantity),
+      }));
     if (validMonsters.length === 0) { setError("Add at least one monster with a name."); return; }
     const payload = {
       event, day: day.trim(),
@@ -2216,6 +2345,110 @@ const AdminEpics = () => {
   );
 };
 
+// ── Export & backup ─────────────────────────────────────────────────────────
+const AdminBackup = () => {
+  const [restoreError, setRestoreError] = useState("");
+  const [restoring, setRestoring] = useState(false);
+  const fileInputRef = useRef(null);
+  const epics = Store.getEpics();
+
+  const exportEpics = () => {
+    const csv = buildEpicsCSV(epics);
+    downloadTextFile(csv, `69-event-tracker-epics-${fileDateStamp()}.csv`, "text/csv;charset=utf-8");
+  };
+
+  const downloadBackup = () => {
+    const json = JSON.stringify(Store.getAll(), null, 2);
+    downloadTextFile(json, `69-event-tracker-backup-${fileDateStamp()}.json`, "application/json");
+  };
+
+  const pickRestoreFile = () => {
+    setRestoreError("");
+    fileInputRef.current && fileInputRef.current.click();
+  };
+
+  const onRestoreFileChosen = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow choosing the same file again later
+    if (!file) return;
+    setRestoreError("");
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch {
+        setRestoreError("That doesn't look like a valid backup file.");
+        return;
+      }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setRestoreError("That doesn't look like a valid backup file.");
+        return;
+      }
+      const looksLikeBackup = ["miniEvents", "mainEvents", "epics", "pins"].some(k => k in parsed);
+      if (!looksLikeBackup) {
+        setRestoreError("That file doesn't look like a 69 Event Tracker backup.");
+        return;
+      }
+      const confirmed = window.confirm(
+        "This replaces ALL current data — epics, scores, tips, rewards, PINs, divisions — with what's in this backup file. This can't be undone. Continue?"
+      );
+      if (!confirmed) return;
+      Store.replaceAll(parsed);
+      setRestoring(true);
+      // Full reload so every screen picks up the restored data cleanly,
+      // rather than trying to force every open component to re-read Store.
+      setTimeout(() => window.location.reload(), 900);
+    };
+    reader.onerror = () => setRestoreError("Couldn't read that file — try again.");
+    reader.readAsText(file);
+  };
+
+  return (
+    <div>
+      <div style={{ ...cardStyle, marginBottom: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginBottom: 2 }}>Export epics &amp; monsters</div>
+        <div style={{ fontSize: 12, color: "#64748b", marginBottom: 10 }}>
+          Every epic and monster you've entered, as a spreadsheet — one row per monster.
+        </div>
+        <button
+          onClick={exportEpics}
+          disabled={epics.length === 0}
+          style={{ ...adminButtonStyle, width: "100%", opacity: epics.length === 0 ? 0.5 : 1 }}
+        >
+          {epics.length === 0 ? "No epics to export yet" : "Download epics & monsters (.csv)"}
+        </button>
+      </div>
+
+      <div style={cardStyle}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginBottom: 2 }}>Full data backup</div>
+        <div style={{ fontSize: 12, color: "#64748b", marginBottom: 10 }}>
+          Everything the app stores — epics, event tips &amp; rewards, scores, divisions, PINs. Keep a copy somewhere safe, and use Restore if anything ever needs undoing.
+        </div>
+        <button onClick={downloadBackup} style={{ ...adminButtonStyle, width: "100%", marginBottom: 8 }}>
+          Download full backup (.json)
+        </button>
+        <button
+          onClick={pickRestoreFile}
+          disabled={restoring}
+          style={{ ...adminButtonStyle, width: "100%", background: "#fff", color: "#dc2626", border: "1px solid #fecaca", opacity: restoring ? 0.6 : 1 }}
+        >
+          {restoring ? "Restoring…" : "Restore from backup…"}
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/json,.json"
+          onChange={onRestoreFileChosen}
+          style={{ display: "none" }}
+        />
+        {restoreError && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 8 }}>{restoreError}</div>}
+        {restoring && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Restored ✓ — reloading…</div>}
+      </div>
+    </div>
+  );
+};
+
 const AdminScreen = () => {
   const session = useSession();
   if (!roleAtLeast(session.role, "admin")) {
@@ -2247,10 +2480,17 @@ const AdminScreen = () => {
         <AdminTips />
       </div>
 
-      <div>
+      <div style={{ marginBottom: 24 }}>
         <div style={sectionLabelStyle}>Epics</div>
         <AdminEpics />
       </div>
+
+      {roleAtLeast(session.role, "superadmin") && (
+        <div>
+          <div style={sectionLabelStyle}>Data &amp; backup</div>
+          <AdminBackup />
+        </div>
+      )}
     </div>
   );
 };
@@ -2264,7 +2504,7 @@ const TABS = [
   { key: "admin", label: "Admin", icon: "gear", minRole: "admin" },
 ];
 
-const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin" };
+const ROLE_LABEL = { viewer: "Viewer", superior: "Superior", admin: "Admin", superadmin: "Super Admin" };
 
 // 100dvh tracks the real visible height on phones (accounting for the address
 // bar showing/hiding); 100vh is the fallback for browsers that don't support it.

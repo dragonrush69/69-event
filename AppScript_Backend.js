@@ -268,20 +268,27 @@ function scrapeEventSchedule() {
   return items;
 }
 
-// ── Run once manually (function dropdown → createHourlyScrapeTrigger → Run)
-// to set up automatic hourly scraping. Safe to re-run — clears any existing
-// scrape trigger first so it never creates duplicates. ─────────────────────
-function createHourlyScrapeTrigger() {
+// ── Run once manually (function dropdown → createScrapeTrigger → Run) to
+// set up automatic scraping. Safe to re-run — clears any existing scrape
+// trigger first so it never creates duplicates. ────────────────────────────
+//
+// Was createHourlyScrapeTrigger() / .everyHours(1).nearMinute(2) — Kirsty
+// observed an event ending at :30 past the hour, i.e. not every event's own
+// cycle resets on the hour the way "Clash of Kingdoms"/"Clash for the
+// Throne" do. A once-an-hour scrape left the cache up to ~57 minutes stale
+// around a boundary like that (worse if the ~15-minute trigger jitter fell
+// the wrong way). index.html's getEffectiveSchedule() already fills in the
+// gaps BETWEEN scrapes live from the client's own clock, using each item's
+// last-scraped `nextStart` as ground truth — but it can only be as accurate
+// as that last scrape's data, so halving the scrape interval halves the
+// worst-case staleness window too. 30 minutes is the shortest interval
+// ScriptApp's minute-based triggers support without stepping down to 15/10/5
+// (which would just burn quota for little real benefit given the client-side
+// smoothing already in place).
+function createScrapeTrigger() {
   ScriptApp.getProjectTriggers().forEach(function(t) {
     if (t.getHandlerFunction() === "scrapeEventSchedule") ScriptApp.deleteTrigger(t);
   });
-  // .nearMinute(2) asks Apps Script to fire close to 2 minutes past each hour
-  // instead of at a random offset anywhere in the hour (the default for
-  // plain everyHours(1)). That keeps the cached schedule close behind the
-  // source site's own hourly reset — a couple of minutes' margin so the
-  // page has settled, instead of drifting up to ~59 minutes stale.
-  // Apps Script only guarantees this within roughly a 15-minute window, not
-  // to the exact minute, but it's the closest control it offers.
-  ScriptApp.newTrigger("scrapeEventSchedule").timeBased().everyHours(1).nearMinute(2).create();
-  Logger.log("Hourly scrape trigger created — scrapeEventSchedule() will now run automatically near the top of every hour (~2 minutes past).");
+  ScriptApp.newTrigger("scrapeEventSchedule").timeBased().everyMinutes(30).create();
+  Logger.log("Scrape trigger created — scrapeEventSchedule() will now run automatically about every 30 minutes.");
 }
