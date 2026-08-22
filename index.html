@@ -169,6 +169,8 @@ const DEFAULT_DATA = {
   schedule: { lastScraped: null, items: [] }, // filled by a future scraper
   pending: [], // viewer-submitted scores awaiting Superior/Admin approval
   epics: [],   // Admin-entered epic monster stat sheets, linked to a Main Event (+ optional day) — see Store.addEpic
+  troops: [],  // Admin-entered troop profiles — a standing reference list, not linked to any event (2026-08-22)
+  faqs: [],    // Admin-managed FAQ entries (question/answer/category), viewer-visible (2026-08-22)
 };
 
 // Fill in a possibly-partial data object (from localStorage or Sheets) with
@@ -182,6 +184,8 @@ function normalizeData(parsed) {
   data.pending = parsed?.pending || [];
   data.pins = { ...DEFAULT_PINS, ...(parsed?.pins || {}) };
   data.epics = parsed?.epics || [];
+  data.troops = parsed?.troops || [];
+  data.faqs = parsed?.faqs || [];
   return data;
 }
 
@@ -397,6 +401,58 @@ const Store = {
     data.epics = (data.epics || []).filter(e => e.id !== id);
     Store._save();
   },
+
+  // ── Troops ───────────────────────────────────────────────────────────
+  // Admin-entered troop reference profiles (Kirsty's request, 2026-08-22).
+  // A flat standing list, not linked to any event — just a database of troop
+  // stats to record for now, with strategy-matching against epics a possible
+  // future feature.
+  getTroops() {
+    return Store._load().troops || [];
+  },
+
+  addTroop(troop) {
+    const data = Store._load();
+    data.troops = [...(data.troops || []), troop];
+    Store._save();
+  },
+
+  updateTroop(id, patch) {
+    const data = Store._load();
+    data.troops = (data.troops || []).map(t => t.id === id ? { ...t, ...patch } : t);
+    Store._save();
+  },
+
+  deleteTroop(id) {
+    const data = Store._load();
+    data.troops = (data.troops || []).filter(t => t.id !== id);
+    Store._save();
+  },
+
+  // ── FAQs ─────────────────────────────────────────────────────────────
+  // Admin-managed Question/Answer/Category entries (Kirsty's request,
+  // 2026-08-22, replacing Approvals' old tab slot with a viewer-visible FAQ tab).
+  getFaqs() {
+    return Store._load().faqs || [];
+  },
+
+  addFaq(faq) {
+    const data = Store._load();
+    data.faqs = [...(data.faqs || []), faq];
+    Store._save();
+  },
+
+  updateFaq(id, patch) {
+    const data = Store._load();
+    data.faqs = (data.faqs || []).map(f => f.id === id ? { ...f, ...patch } : f);
+    Store._save();
+  },
+
+  deleteFaq(id) {
+    const data = Store._load();
+    data.faqs = (data.faqs || []).filter(f => f.id !== id);
+    Store._save();
+  },
 };
 
 // ── Epic paste parser ───────────────────────────────────────────────────
@@ -455,6 +511,44 @@ function parseEpicPaste(text) {
   if (!epicName) return { error: "Couldn't find an epic name in the first column of any row." };
   if (monsters.length === 0) return { error: "Couldn't find any rows with a monster name." };
   return { epicName, captainHero, numCaptains, monsters };
+}
+
+// ── Troop paste parser ──────────────────────────────────────────────────
+// Turns tab-separated rows (pasted straight from a spreadsheet) into a list
+// of troop profile objects. Column order matches Kirsty's starter schema
+// (2026-08-22): Type | Level | Name | Types | Type | Strength Against |
+// Strength Against | Strength | Health | Leadership | Authority | Dominance |
+// Cost per Unit | Group Order. Unlike epics, there's no parent record — every
+// row IS a complete, standalone troop, and values (e.g. "110,200") are kept
+// exactly as pasted rather than parsed as numbers, since this is a reference
+// list, not something calculated from.
+const TROOP_FIELDS = [
+  "type1", "level", "name", "types", "type2", "strengthAgainst1", "strengthAgainst2",
+  "strength", "health", "leadership", "authority", "dominance", "costPerUnit", "groupOrder",
+];
+
+function parseTroopPaste(text) {
+  const lines = (text || "").trim().split(/\r?\n/).filter(l => l.trim() !== "");
+  if (lines.length === 0) return { error: "Paste at least one row of troop data." };
+
+  let rows = lines.map(l => l.split("\t"));
+  // Skip a header row if it looks like one (first cell literally "Type").
+  if (rows[0][0] && rows[0][0].trim().toLowerCase() === "type") {
+    rows = rows.slice(1);
+  }
+  if (rows.length === 0) return { error: "No data rows found after the header." };
+
+  const troops = [];
+  for (const cols of rows) {
+    const clean = cols.map(c => (c || "").trim());
+    if (clean.length < 3 || !clean[2]) continue; // need at least a Name (col 3) to count as a row
+    const troop = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+    TROOP_FIELDS.forEach((field, i) => { troop[field] = clean[i] || ""; });
+    troops.push(troop);
+  }
+
+  if (troops.length === 0) return { error: "Couldn't find any rows with a troop name." };
+  return { troops };
 }
 
 function resolvePin(pin) {
@@ -857,11 +951,19 @@ const Icon = ({ name, size = 18, style }) => {
           <path d="M9 20h6l-1-3h-4l-1 3Z" />
         </svg>
       );
-    case "inbox": // Approvals tab
+    case "inbox": // Approvals — no longer a tab (moved into Admin, 2026-08-22), kept in case it's needed again
       return (
         <svg {...common}>
           <path d="M3 13h5l2 3h4l2-3h5" />
           <path d="M5.5 5h13L21 13v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5L5.5 5Z" />
+        </svg>
+      );
+    case "faq": // FAQ tab
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M9.2 9a2.8 2.8 0 1 1 3.8 2.6c-.7.3-1 .8-1 1.4v.4" />
+          <line x1="12" y1="16.5" x2="12" y2="16.5" strokeWidth="2.6" />
         </svg>
       );
     case "gear": { // Admin tab
@@ -1585,61 +1687,6 @@ const MainEventsScreen = () => {
 };
 
 // ─── APPROVALS (Superior + Admin) ──────────────────────────────────────────
-const ApprovalsScreen = () => {
-  const [, setTick] = useState(0);
-  const pending = Store.getPending();
-
-  const approve = (id) => { Store.approvePending(id); setTick(t => t + 1); };
-  const reject = (id) => { Store.rejectPending(id); setTick(t => t + 1); };
-
-  return (
-    <div style={{ padding: "20px 20px 100px" }}>
-      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Approvals</h2>
-      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
-        Scores submitted by players, waiting for review.
-      </p>
-
-      {pending.length === 0 ? (
-        <div style={{
-          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
-          color: "#94a3b8", fontSize: 13, textAlign: "center",
-        }}>Nothing pending — all caught up.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {pending.map(p => (
-            <div key={p.id} style={cardStyle}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{p.eventName}</div>
-                <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
-                  {p.category === "mini" ? "Mini" : MAIN_CATEGORY_LABEL[MAIN_EVENT_LOOKUP[p.eventName]?.category] || "Main"}
-                </span>
-              </div>
-              <div style={{ fontSize: 12, color: "#64748b", margin: "2px 0 8px" }}>
-                Submitted by {p.submittedBy} · {formatDateTime(p.submittedAt)}
-                {p.division ? ` · Division ${p.division}` : ""}
-              </div>
-              <div style={{ fontSize: 13, marginBottom: 10 }}>
-                <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(p.highest)}</span>
-                {"  "}
-                <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(p.lowest)}</span>
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button
-                  onClick={() => approve(p.id)}
-                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "#16a34a", color: "#fff", fontSize: 13, fontWeight: 600 }}
-                >Approve</button>
-                <button
-                  onClick={() => reject(p.id)}
-                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "1px solid #fca5a5", background: "#fff", color: "#dc2626", fontSize: 13, fontWeight: 600 }}
-                >Reject</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-};
 
 const MiniEventsScreen = () => {
   const session = useSession();
@@ -1691,6 +1738,89 @@ const MiniEventsScreen = () => {
             </button>
           );
         })}
+      </div>
+    </div>
+  );
+};
+
+// ─── FAQ (viewer-facing, replaces Approvals' old tab slot, 2026-08-22) ─────
+// Grouped by category — tap a category to see its questions (Kirsty's
+// request), rather than one long flat list.
+const FAQCategoryDetail = ({ category, items, onBack }) => (
+  <div style={{ padding: "20px 20px 100px" }}>
+    <button onClick={onBack} style={{
+      background: "none", border: "none", color: "#2563eb", fontSize: 14,
+      padding: "6px 0 14px", fontWeight: 600,
+    }}>&larr; All FAQs</button>
+
+    <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 16px" }}>{category}</h2>
+
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {items.map(f => (
+        <div key={f.id} style={cardStyle}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#0f172a", marginBottom: 6 }}>{f.question}</div>
+          <div style={{ fontSize: 13, color: "#475569", whiteSpace: "pre-wrap" }}>{f.answer}</div>
+        </div>
+      ))}
+    </div>
+  </div>
+);
+
+const FAQScreen = () => {
+  const [selectedCategory, setSelectedCategory] = useState(null);
+  const faqs = Store.getFaqs();
+
+  if (faqs.length === 0) {
+    return (
+      <div style={{ padding: "20px 20px 100px" }}>
+        <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>FAQs</h2>
+        <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+          Frequently asked questions.
+        </p>
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>No FAQs added yet — these can be added from Admin.</div>
+      </div>
+    );
+  }
+
+  // Group by category, preserving the order categories first appear in.
+  const categories = [];
+  const byCategory = {};
+  faqs.forEach(f => {
+    const cat = (f.category || "").trim() || "Uncategorized";
+    if (!byCategory[cat]) { byCategory[cat] = []; categories.push(cat); }
+    byCategory[cat].push(f);
+  });
+
+  if (selectedCategory) {
+    return (
+      <FAQCategoryDetail
+        category={selectedCategory}
+        items={byCategory[selectedCategory] || []}
+        onBack={() => setSelectedCategory(null)}
+      />
+    );
+  }
+
+  return (
+    <div style={{ padding: "20px 20px 100px" }}>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>FAQs</h2>
+      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+        Tap a category to see its questions.
+      </p>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {categories.map(cat => (
+          <button key={cat} onClick={() => setSelectedCategory(cat)} style={cardStyle}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{cat}</div>
+              <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                {byCategory[cat].length}
+              </span>
+            </div>
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -2345,6 +2475,200 @@ const AdminEpics = () => {
   );
 };
 
+// ── Troops ───────────────────────────────────────────────────────────────
+const TROOP_FIELD_DEFS = [
+  { key: "type1", label: "Type 1", width: 70 },
+  { key: "level", label: "Level", width: 60 },
+  { key: "name", label: "Name", width: 150 },
+  { key: "types", label: "Types", width: 100 },
+  { key: "type2", label: "Type 2", width: 100 },
+  { key: "strengthAgainst1", label: "Strength Against 1", width: 140 },
+  { key: "strengthAgainst2", label: "Strength Against 2", width: 140 },
+  { key: "strength", label: "Strength", width: 100 },
+  { key: "health", label: "Health", width: 100 },
+  { key: "leadership", label: "Leadership", width: 100 },
+  { key: "authority", label: "Authority", width: 100 },
+  { key: "dominance", label: "Dominance", width: 100 },
+  { key: "costPerUnit", label: "Cost per Unit", width: 110 },
+  { key: "groupOrder", label: "Group Order", width: 100 },
+];
+
+function emptyTroopRow() {
+  const t = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+  TROOP_FIELD_DEFS.forEach(f => { t[f.key] = ""; });
+  return t;
+}
+
+const TroopFieldGrid = ({ troop, onChange }) => (
+  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+    {TROOP_FIELD_DEFS.map(f => (
+      <div key={f.key} style={{ flex: `0 0 ${f.width}px`, minWidth: f.width }}>
+        <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2, textTransform: "uppercase", fontWeight: 600 }}>{f.label}</div>
+        <input
+          value={troop[f.key] || ""}
+          onChange={e => onChange(f.key, e.target.value)}
+          style={{ width: "100%", padding: "6px 8px", borderRadius: 6, border: "1px solid #cbd5e1", fontSize: 13, boxSizing: "border-box" }}
+        />
+      </div>
+    ))}
+  </div>
+);
+
+const TROOP_PASTE_PLACEHOLDER =
+  "Paste rows copied from a spreadsheet (tab-separated) — one row per troop:\n" +
+  "Type\tLevel\tName\tTypes\tType\tStrength Against\tStrength Against\tStrength\tHealth\tLeadership\tAuthority\tDominance\tCost per Unit\tGroup Order";
+
+const AdminTroops = () => {
+  const [, setTick] = useState(0);
+  const [editingId, setEditingId] = useState(null);
+  const [troop, setTroop] = useState(emptyTroopRow());
+  const [showPaste, setShowPaste] = useState(false);
+  const [paste, setPaste] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const troops = Store.getTroops();
+
+  const updateField = (key, value) => setTroop(t => ({ ...t, [key]: value }));
+
+  const resetForm = () => {
+    setEditingId(null);
+    setTroop(emptyTroopRow());
+    setShowPaste(false); setPaste(""); setError("");
+  };
+
+  const startEdit = (t) => {
+    setError("");
+    setEditingId(t.id);
+    setTroop({ ...emptyTroopRow(), ...t });
+    setShowPaste(false);
+    setPaste("");
+  };
+
+  const saveTroop = () => {
+    setError("");
+    const cleanName = (troop.name || "").trim();
+    if (!cleanName) { setError("Give this troop a name first."); return; }
+    const payload = { ...troop, name: cleanName };
+    if (editingId) {
+      Store.updateTroop(editingId, payload);
+    } else {
+      Store.addTroop({ ...payload, id: payload.id || `${Date.now()}-${Math.random().toString(36).slice(2, 7)}` });
+    }
+    resetForm();
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+  };
+
+  // Every pasted row is a complete, standalone troop (unlike Epics' paste,
+  // which fills sub-rows of one parent form) — so pasting adds them straight
+  // to the list rather than just filling the form above.
+  const addFromPaste = () => {
+    setError("");
+    const result = parseTroopPaste(paste);
+    if (result.error) { setError(result.error); return; }
+    result.troops.forEach(t => Store.addTroop(t));
+    setPaste("");
+    setShowPaste(false);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+  };
+
+  const remove = (id) => {
+    if (window.confirm("Delete this troop? This can't be undone.")) {
+      Store.deleteTroop(id);
+      if (editingId === id) resetForm();
+      setTick(t => t + 1);
+    }
+  };
+
+  return (
+    <div>
+      {editingId && (
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8,
+          padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#1d4ed8", fontWeight: 600,
+        }}>
+          <span>Editing "{troop.name || "troop"}"</span>
+          <button
+            onClick={resetForm}
+            style={{ background: "none", border: "none", color: "#1d4ed8", fontSize: 12, fontWeight: 700, padding: "2px 4px" }}
+          >Cancel</button>
+        </div>
+      )}
+
+      <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: 10, marginBottom: 10 }}>
+        <TroopFieldGrid troop={troop} onChange={updateField} />
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <button onClick={saveTroop} style={{ ...adminButtonStyle, flex: 1 }}>
+          {editingId ? "Save changes" : "Save troop"}
+        </button>
+        {editingId && (
+          <button
+            onClick={resetForm}
+            style={{ ...adminButtonStyle, flex: 1, background: "#fff", color: "#0f172a", border: "1px solid #cbd5e1" }}
+          >Cancel</button>
+        )}
+      </div>
+
+      <button
+        onClick={() => setShowPaste(s => !s)}
+        style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "2px 0", marginBottom: 8 }}
+      >{showPaste ? "Hide paste-to-add" : "Paste from a spreadsheet instead ▾"}</button>
+      {showPaste && (
+        <div style={{ marginBottom: 10 }}>
+          <textarea
+            value={paste} onChange={e => setPaste(e.target.value)}
+            placeholder={TROOP_PASTE_PLACEHOLDER}
+            rows={3}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 12, fontFamily: "monospace", boxSizing: "border-box", resize: "vertical", marginBottom: 6 }}
+          />
+          <button onClick={addFromPaste} style={{ ...adminButtonStyle, width: "100%" }}>Add troop(s) from paste</button>
+        </div>
+      )}
+
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 2, marginBottom: 8, textAlign: "center" }}>Saved ✓</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginBottom: 8 }}>{error}</div>}
+
+      {troops.length > 0 && (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+          {troops.map(t => (
+            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a" }}>{t.name}</div>
+                <div style={{ fontSize: 12, color: "#64748b" }}>
+                  {[t.level && `Level ${t.level}`, t.types, t.type2].filter(Boolean).join(" · ")}
+                </div>
+                {(t.strength || t.health) && (
+                  <div style={{ fontSize: 12, color: "#64748b" }}>
+                    {t.strength ? `Strength ${formatMaybeNum(t.strength)}` : ""}
+                    {t.strength && t.health ? " · " : ""}
+                    {t.health ? `Health ${formatMaybeNum(t.health)}` : ""}
+                  </div>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 4 }}>
+                <button
+                  onClick={() => startEdit(t)}
+                  style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Edit</button>
+                <button
+                  onClick={() => remove(t.id)}
+                  style={{ background: "none", border: "none", color: "#dc2626", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Export & backup ─────────────────────────────────────────────────────────
 const AdminBackup = () => {
   const [restoreError, setRestoreError] = useState("");
@@ -2449,6 +2773,189 @@ const AdminBackup = () => {
   );
 };
 
+// ── Approvals (moved from its own tab into Admin, 2026-08-22 — Kirsty's
+// choice: Approvals becomes Admin-only, Superior no longer has direct access) ──
+const AdminApprovals = () => {
+  const [, setTick] = useState(0);
+  const pending = Store.getPending();
+
+  const approve = (id) => { Store.approvePending(id); setTick(t => t + 1); };
+  const reject = (id) => { Store.rejectPending(id); setTick(t => t + 1); };
+
+  return (
+    <div>
+      {pending.length === 0 ? (
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>Nothing pending — all caught up.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {pending.map(p => (
+            <div key={p.id} style={cardStyle}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{p.eventName}</div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                  {p.category === "mini" ? "Mini" : MAIN_CATEGORY_LABEL[MAIN_EVENT_LOOKUP[p.eventName]?.category] || "Main"}
+                </span>
+              </div>
+              <div style={{ fontSize: 12, color: "#64748b", margin: "2px 0 8px" }}>
+                Submitted by {p.submittedBy} · {formatDateTime(p.submittedAt)}
+                {p.division ? ` · Division ${p.division}` : ""}
+              </div>
+              <div style={{ fontSize: 13, marginBottom: 10 }}>
+                <span style={{ color: "#16a34a", fontWeight: 600 }}>H {formatScore(p.highest)}</span>
+                {"  "}
+                <span style={{ color: "#dc2626", fontWeight: 600 }}>L {formatScore(p.lowest)}</span>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => approve(p.id)}
+                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: "#16a34a", color: "#fff", fontSize: 13, fontWeight: 600 }}
+                >Approve</button>
+                <button
+                  onClick={() => reject(p.id)}
+                  style={{ flex: 1, padding: "9px", borderRadius: 8, border: "1px solid #fca5a5", background: "#fff", color: "#dc2626", fontSize: 13, fontWeight: 600 }}
+                >Reject</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── FAQ management (Admin: add/edit/delete Question + Answer + Category) ──
+const AdminFAQ = () => {
+  const [, setTick] = useState(0);
+  const [editingId, setEditingId] = useState(null);
+  const [category, setCategory] = useState("");
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const faqs = Store.getFaqs();
+  const existingCategories = [...new Set(faqs.map(f => (f.category || "").trim()).filter(Boolean))];
+
+  const resetForm = () => {
+    setEditingId(null);
+    setCategory(""); setQuestion(""); setAnswer(""); setError("");
+  };
+
+  const startEdit = (f) => {
+    setError("");
+    setEditingId(f.id);
+    setCategory(f.category || "");
+    setQuestion(f.question || "");
+    setAnswer(f.answer || "");
+  };
+
+  const saveFaq = () => {
+    setError("");
+    const cleanQuestion = question.trim();
+    const cleanAnswer = answer.trim();
+    if (!cleanQuestion) { setError("Give this FAQ a question first."); return; }
+    if (!cleanAnswer) { setError("Add an answer too."); return; }
+    const payload = { category: category.trim() || "Uncategorized", question: cleanQuestion, answer: cleanAnswer };
+    if (editingId) {
+      Store.updateFaq(editingId, payload);
+    } else {
+      Store.addFaq({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...payload });
+    }
+    resetForm();
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+  };
+
+  const remove = (id) => {
+    if (window.confirm("Delete this FAQ entry? This can't be undone.")) {
+      Store.deleteFaq(id);
+      if (editingId === id) resetForm();
+      setTick(t => t + 1);
+    }
+  };
+
+  return (
+    <div>
+      {editingId && (
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8,
+          padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#1d4ed8", fontWeight: 600,
+        }}>
+          <span>Editing FAQ</span>
+          <button
+            onClick={resetForm}
+            style={{ background: "none", border: "none", color: "#1d4ed8", fontSize: 12, fontWeight: 700, padding: "2px 4px" }}
+          >Cancel</button>
+        </div>
+      )}
+
+      <input
+        value={category} onChange={e => setCategory(e.target.value)}
+        placeholder="Category (e.g. Scoring)"
+        list="faq-category-options"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <datalist id="faq-category-options">
+        {existingCategories.map(c => <option key={c} value={c} />)}
+      </datalist>
+      <input
+        value={question} onChange={e => setQuestion(e.target.value)}
+        placeholder="Question"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <textarea
+        value={answer} onChange={e => setAnswer(e.target.value)}
+        placeholder="Answer"
+        rows={3}
+        style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box", resize: "vertical", marginBottom: 8 }}
+      />
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={saveFaq} style={{ ...adminButtonStyle, flex: 1 }}>
+          {editingId ? "Save changes" : "Save FAQ"}
+        </button>
+        {editingId && (
+          <button
+            onClick={resetForm}
+            style={{ ...adminButtonStyle, flex: 1, background: "#fff", color: "#0f172a", border: "1px solid #cbd5e1" }}
+          >Cancel</button>
+        )}
+      </div>
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 8 }}>{error}</div>}
+
+      {faqs.length > 0 && (
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {faqs.map(f => (
+            <div key={f.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                  {f.category}
+                </span>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginTop: 4 }}>{f.question}</div>
+              </div>
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                <button
+                  onClick={() => startEdit(f)}
+                  style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Edit</button>
+                <button
+                  onClick={() => remove(f.id)}
+                  style={{ background: "none", border: "none", color: "#dc2626", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AdminScreen = () => {
   const session = useSession();
   if (!roleAtLeast(session.role, "admin")) {
@@ -2462,7 +2969,7 @@ const AdminScreen = () => {
     <div style={{ padding: "20px 20px 100px" }}>
       <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Admin</h2>
       <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>
-        Passwords, divisions, event tips, rewards &amp; epics.
+        Passwords, divisions, event tips, rewards, epics, troops, FAQs &amp; approvals.
       </p>
 
       <div style={{ marginBottom: 24 }}>
@@ -2485,6 +2992,21 @@ const AdminScreen = () => {
         <AdminEpics />
       </div>
 
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>Troops</div>
+        <AdminTroops />
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>FAQs</div>
+        <AdminFAQ />
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>Approvals</div>
+        <AdminApprovals />
+      </div>
+
       {roleAtLeast(session.role, "superadmin") && (
         <div>
           <div style={sectionLabelStyle}>Data &amp; backup</div>
@@ -2500,7 +3022,7 @@ const TABS = [
   { key: "feed", label: "News Feed", icon: "feed", minRole: "viewer" },
   { key: "mini", label: "Mini Events", icon: "clock", minRole: "viewer" },
   { key: "main", label: "Main Events", icon: "trophy", minRole: "viewer" },
-  { key: "approvals", label: "Approvals", icon: "inbox", minRole: "superior" },
+  { key: "faq", label: "FAQs", icon: "faq", minRole: "viewer" },
   { key: "admin", label: "Admin", icon: "gear", minRole: "admin" },
 ];
 
@@ -2513,7 +3035,10 @@ const FULL_HEIGHT = (typeof CSS !== "undefined" && CSS.supports && CSS.supports(
 const AppShell = ({ role, onLogout }) => {
   const [tab, setTab] = useState("feed");
   const visibleTabs = TABS.filter(t => roleAtLeast(role, t.minRole));
-  const pendingCount = roleAtLeast(role, "superior") ? Store.getPending().length : 0;
+  // Approvals lives inside Admin now (2026-08-22), so the pending-count badge
+  // moved from its own tab to the Admin tab, and only shows for Admin+
+  // (Superior no longer has approvals access).
+  const pendingCount = roleAtLeast(role, "admin") ? Store.getPending().length : 0;
 
   return (
     <SessionCtx.Provider value={{ role }}>
@@ -2542,7 +3067,7 @@ const AppShell = ({ role, onLogout }) => {
           {tab === "feed" && <NewsFeedScreen />}
           {tab === "mini" && <MiniEventsScreen />}
           {tab === "main" && <MainEventsScreen />}
-          {tab === "approvals" && <ApprovalsScreen />}
+          {tab === "faq" && <FAQScreen />}
           {tab === "admin" && <AdminScreen />}
         </main>
 
@@ -2564,7 +3089,7 @@ const AppShell = ({ role, onLogout }) => {
             >
               <span style={{ position: "relative", display: "flex" }}>
                 <Icon name={t.icon} size={20} />
-                {t.key === "approvals" && pendingCount > 0 && (
+                {t.key === "admin" && pendingCount > 0 && (
                   <span style={{
                     position: "absolute", top: -4, right: -10, background: "#dc2626", color: "#fff",
                     fontSize: 9, fontWeight: 700, borderRadius: 999, padding: "1px 5px", lineHeight: "12px",
