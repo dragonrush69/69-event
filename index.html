@@ -56,7 +56,7 @@ function roleAtLeast(role, min) {
 // matching AppScript_Backend.js file + setup guide). Until this is filled
 // in, the app runs fine on its own using only the browser's local storage —
 // each device just won't see other devices' data.
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbxdwm-0VtXCsQZWU-2UDJDRU-rtJ6v9R6jt6jC_RptRxVTJJaoGIBh8V7WaQRNdH3HKag/exec";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzrsxh0DGl-nr6wPwckCF8jhf8mFNzspxxyyxGnykiMY4cNy7-Kallnl2sZs4qK-uUeQw/exec";
 
 const sheetsEnabled = () => SHEETS_URL && !SHEETS_URL.startsWith("YOUR_");
 
@@ -75,6 +75,9 @@ async function loadFromSheets() {
 // Fire-and-forget: Apps Script Web Apps don't return CORS headers on POST,
 // so we use no-cors and never read the response — errors here are network
 // failures only (e.g. offline), not rejections from the script itself.
+// Because of that, this function on its own can never tell us whether the
+// write actually landed — see syncToSheetsWithRetry() below, which wraps
+// this with a follow-up read to verify it, and retries if it didn't.
 async function saveToSheets(data) {
   if (!sheetsEnabled()) return;
   try {
@@ -87,6 +90,42 @@ async function saveToSheets(data) {
   } catch (err) {
     console.warn("Sheets save failed:", err);
   }
+}
+
+// ─── Sync verification + retry (2026-08-23) ────────────────────────────────
+// Incident: a background save silently failed to reach Sheets, then the next
+// app load pulled the (stale) Sheets copy and overwrote it over the local
+// data that had the real change — wiping FAQs Kirsty had just added. Root
+// cause was two-fold: (1) saveToSheets() above has no way to confirm a write
+// landed, so a failure was invisible; (2) loadFromRemote() unconditionally
+// treated Sheets as authoritative on every load, even when local had a newer
+// change Sheets never received. Fixed by stamping every save with `savedAt`
+// (Store._save()) and: (a) here, verifying a write landed by reading it back
+// and comparing `savedAt`, retrying a few times if it didn't; (b) in
+// loadFromRemote() below, refusing to overwrite local data whose `savedAt`
+// is newer than what Sheets currently has.
+const SYNC_RETRY_DELAYS_MS = [1500, 3000, 6000]; // backoff between verify attempts
+
+async function syncToSheetsWithRetry(data, attempt = 0) {
+  if (!sheetsEnabled()) return;
+  Store._setSyncStatus("pending");
+  await saveToSheets(data);
+  await new Promise(resolve => setTimeout(resolve, SYNC_RETRY_DELAYS_MS[attempt] || 1500));
+  const remote = await loadFromSheets();
+  const landed = !!(remote && !remote.error && remote.savedAt === data.savedAt);
+  if (landed) {
+    Store._setSyncStatus("synced");
+    return;
+  }
+  if (attempt < SYNC_RETRY_DELAYS_MS.length - 1) {
+    syncToSheetsWithRetry(data, attempt + 1);
+    return;
+  }
+  // Out of retries — don't touch local data, just surface it so it isn't
+  // silently lost the way the FAQs were. AppShell shows a banner for this
+  // (see useSyncStatus()) and the next successful save/load will retry again.
+  console.warn("Sync to Sheets did not land after retries — local changes are safe, but not yet shared.");
+  Store._setSyncStatus("failed");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -167,6 +206,12 @@ function buildDefaultMainEvents() {
 // Divisions. Just a sensible starting point, not a fixed/locked list.
 const DEFAULT_FAQ_CATEGORIES = ["General", "Scoring", "Events & Timing", "Epics", "Troops", "Access & Roles"];
 
+// Starter categories for Tools & Links — a separate lookup from FAQ
+// categories (Kirsty's request, 2026-08-23: "separate tool categories" so
+// tools/links can group differently to FAQ topics). Same editable-afterwards
+// pattern.
+const DEFAULT_TOOL_CATEGORIES = ["Calculators", "Automation Tools", "Guides", "Downloads"];
+
 const DEFAULT_DATA = {
   pins: { ...DEFAULT_PINS },
   divisions: [],       // e.g. ["X - 9", "VII - 21"] — grows as people use new ones; full add/delete management is an Admin feature
@@ -178,6 +223,8 @@ const DEFAULT_DATA = {
   troops: [],  // Admin-entered troop profiles — a standing reference list, not linked to any event (2026-08-22)
   faqs: [],    // Admin-managed FAQ entries (question/answer/category), viewer-visible (2026-08-22)
   faqCategories: [...DEFAULT_FAQ_CATEGORIES], // managed lookup list, same pattern as divisions (2026-08-22)
+  tools: [],   // Admin-managed Tools & Links entries (name/link/guide/category), viewer-visible, shares the FAQ tab (2026-08-23)
+  toolCategories: [...DEFAULT_TOOL_CATEGORIES], // managed lookup list, separate from faqCategories (2026-08-23)
 };
 
 // Fill in a possibly-partial data object (from localStorage or Sheets) with
@@ -197,11 +244,32 @@ function normalizeData(parsed) {
   // — an explicitly emptied list (she deleted every category) stays empty,
   // same "|| []" pattern as every other array field here.
   data.faqCategories = parsed?.faqCategories || [...DEFAULT_FAQ_CATEGORIES];
+  data.tools = parsed?.tools || [];
+  data.toolCategories = parsed?.toolCategories || [...DEFAULT_TOOL_CATEGORIES];
   return data;
 }
 
 const Store = {
   _cache: null,
+
+  // Plain (non-React) pub-sub for sync status, consumed via useSyncStatus()
+  // below — "idle" (nothing to sync / Sheets not configured), "pending" (a
+  // save is in flight or being retried), "synced" (last save confirmed to
+  // have landed), "failed" (retries exhausted — local data is safe, just
+  // not yet on the shared copy). See the 2026-08-23 sync-verification note
+  // above loadFromSheets/syncToSheetsWithRetry for why this exists.
+  _syncStatus: "idle",
+  _syncListeners: [],
+
+  _setSyncStatus(status) {
+    Store._syncStatus = status;
+    Store._syncListeners.forEach(fn => fn(status));
+  },
+
+  onSyncStatusChange(fn) {
+    Store._syncListeners.push(fn);
+    return () => { Store._syncListeners = Store._syncListeners.filter(f => f !== fn); };
+  },
 
   _load() {
     if (Store._cache) return Store._cache;
@@ -215,15 +283,29 @@ const Store = {
   },
 
   // Pull the shared copy down from Google Sheets and make it the active
-  // cache (Sheets is treated as the source of truth once configured).
-  // Returns true on success, false if Sheets isn't configured or unreachable
-  // — callers should fall back to whatever's already in localStorage.
+  // cache (Sheets is treated as the source of truth once configured) —
+  // UNLESS local has a change Sheets never received (local's `savedAt` is
+  // newer than the remote copy's), in which case overwriting would silently
+  // destroy that change — exactly what happened to Kirsty's FAQs on
+  // 2026-08-23. In that case, keep local and re-attempt the sync instead of
+  // trusting the stale remote copy. Returns true on success (whichever copy
+  // ended up active), false if Sheets isn't configured or unreachable —
+  // callers should fall back to whatever's already in localStorage.
   async loadFromRemote() {
     if (!sheetsEnabled()) return false;
+    const local = Store._load(); // ensures local (with its real savedAt) is loaded first
     const remote = await loadFromSheets();
     if (!remote || remote.error) return false;
+    const localSavedAt = local.savedAt || 0;
+    const remoteSavedAt = remote.savedAt || 0;
+    if (localSavedAt > remoteSavedAt) {
+      Store._setSyncStatus("pending");
+      syncToSheetsWithRetry(local);
+      return true;
+    }
     Store._cache = normalizeData(remote);
     Store._persistLocal();
+    Store._setSyncStatus("synced");
     return true;
   },
 
@@ -232,8 +314,12 @@ const Store = {
   },
 
   _save() {
+    // Stamped on every local write, BEFORE the (possibly failing) background
+    // sync even starts — this is what lets loadFromRemote() later tell a
+    // genuine unsynced local change apart from a stale copy safe to discard.
+    Store._cache.savedAt = Date.now();
     Store._persistLocal();
-    if (sheetsEnabled()) saveToSheets(Store._cache); // fire-and-forget background sync
+    if (sheetsEnabled()) syncToSheetsWithRetry(Store._cache); // verified + retried, see above
   },
 
   getAll() {
@@ -487,6 +573,57 @@ const Store = {
   removeFaqCategory(name) {
     const data = Store._load();
     data.faqCategories = (data.faqCategories || []).filter(c => c !== name);
+    Store._save();
+  },
+
+  // ── Tools & Links ────────────────────────────────────────────────────
+  // Admin-managed entries pointing at external tools/links (e.g. a Lava
+  // Calculator, an Autoclicker download) plus an optional free-text "how to
+  // use it" guide. Lives inside the same viewer-facing tab as FAQs, split by
+  // a toggle (Kirsty's request, 2026-08-23).
+  getTools() {
+    return Store._load().tools || [];
+  },
+
+  addTool(tool) {
+    const data = Store._load();
+    data.tools = [...(data.tools || []), tool];
+    Store._save();
+  },
+
+  updateTool(id, patch) {
+    const data = Store._load();
+    data.tools = (data.tools || []).map(t => t.id === id ? { ...t, ...patch } : t);
+    Store._save();
+  },
+
+  deleteTool(id) {
+    const data = Store._load();
+    data.tools = (data.tools || []).filter(t => t.id !== id);
+    Store._save();
+  },
+
+  // ── Tool categories ──────────────────────────────────────────────────
+  // A managed lookup list, same pattern as Divisions/FAQ categories, but
+  // kept separate from faqCategories — tools group differently to FAQ
+  // topics (2026-08-23).
+  getToolCategories() {
+    return Store._load().toolCategories || [];
+  },
+
+  ensureToolCategory(name) {
+    const clean = (name || "").trim();
+    if (!clean) return;
+    const data = Store._load();
+    if (!data.toolCategories.includes(clean)) {
+      data.toolCategories = [...data.toolCategories, clean];
+      Store._save();
+    }
+  },
+
+  removeToolCategory(name) {
+    const data = Store._load();
+    data.toolCategories = (data.toolCategories || []).filter(c => c !== name);
     Store._save();
   },
 };
@@ -932,6 +1069,15 @@ function useTicker() {
     return () => clearInterval(id);
   }, []);
   return now;
+}
+
+// Reactively tracks Store's sync status (see Store._setSyncStatus /
+// onSyncStatusChange, 2026-08-23) so AppShell can show a banner when a save
+// hasn't been confirmed to reach Sheets yet, instead of that failing silently.
+function useSyncStatus() {
+  const [status, setStatus] = useState(Store._syncStatus);
+  useEffect(() => Store.onSyncStatusChange(setStatus), []);
+  return status;
 }
 
 // Formats a millisecond duration the same way totalcalculator.org does
@@ -1802,46 +1948,119 @@ const FAQCategoryDetail = ({ category, items, onBack }) => (
   </div>
 );
 
-const FAQScreen = () => {
-  const [selectedCategory, setSelectedCategory] = useState(null);
-  const faqs = Store.getFaqs();
+// ─── Tools & Links (viewer-facing, shares the FAQ tab via a toggle,
+// 2026-08-23) ───────────────────────────────────────────────────────────
+// Each entry points at an external tool/link (Lava Calculator, an
+// Autoclicker download, etc.) with an optional free-text "how to use it"
+// guide — Kirsty wasn't sure how the guide content should be structured
+// ("I imagine it will be different each time"), so it's a plain multi-line
+// text box rather than fixed numbered steps: she can write a paragraph, her
+// own numbered list, or nothing at all, and it renders as typed.
+const ToolCard = ({ tool }) => {
+  const [expanded, setExpanded] = useState(false);
+  const hasGuide = !!(tool.guide && tool.guide.trim());
 
-  if (faqs.length === 0) {
-    return (
-      <div style={{ padding: "20px 20px 100px" }}>
-        <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>FAQs</h2>
-        <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
-          Frequently asked questions.
-        </p>
-        <div style={{
-          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
-          color: "#94a3b8", fontSize: 13, textAlign: "center",
-        }}>No FAQs added yet — these can be added from Admin.</div>
+  return (
+    <div style={cardStyle}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "#0f172a" }}>{tool.name}</div>
+        {tool.comingSoon ? (
+          <span style={{
+            fontSize: 11, fontWeight: 600, color: "#92400e", background: "#fef3c7",
+            padding: "2px 8px", borderRadius: 999, flexShrink: 0, whiteSpace: "nowrap",
+          }}>Coming soon</span>
+        ) : tool.url ? (
+          <a
+            href={tool.url} target="_blank" rel="noopener noreferrer"
+            style={{ fontSize: 12, fontWeight: 700, color: "#2563eb", flexShrink: 0, whiteSpace: "nowrap" }}
+          >Open ↗</a>
+        ) : null}
       </div>
-    );
-  }
+      {hasGuide && (
+        <>
+          <button
+            onClick={() => setExpanded(e => !e)}
+            style={{ background: "none", border: "none", color: "#475569", fontSize: 12, fontWeight: 600, padding: "8px 0 0" }}
+          >{expanded ? "Hide how to use ▲" : "How to use ▾"}</button>
+          {expanded && (
+            <div style={{ fontSize: 13, color: "#475569", whiteSpace: "pre-wrap", marginTop: 6 }}>{tool.guide}</div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+const ToolsCategoryDetail = ({ category, items, onBack }) => (
+  <div style={{ padding: "20px 20px 100px" }}>
+    <button onClick={onBack} style={{
+      background: "none", border: "none", color: "#2563eb", fontSize: 14,
+      padding: "6px 0 14px", fontWeight: 600,
+    }}>&larr; All Tools &amp; Links</button>
+
+    <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 16px" }}>{category}</h2>
+
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {items.map(t => <ToolCard key={t.id} tool={t} />)}
+    </div>
+  </div>
+);
+
+// Small pill-style toggle used at the top of FAQScreen to switch between
+// FAQs and Tools & Links.
+const faqSectionToggleStyle = (active) => ({
+  flex: 1, padding: "8px 0", borderRadius: 8, fontSize: 13, fontWeight: 700,
+  border: active ? "1px solid #2563eb" : "1px solid #e2e8f0",
+  background: active ? "#2563eb" : "#fff",
+  color: active ? "#fff" : "#475569",
+});
+
+const FAQScreen = () => {
+  const [section, setSection] = useState("faq"); // "faq" | "tools"
+  const [selectedCategory, setSelectedCategory] = useState(null);
+
+  const switchSection = (next) => {
+    if (next === section) return;
+    setSection(next);
+    setSelectedCategory(null);
+  };
+
+  const items = section === "faq" ? Store.getFaqs() : Store.getTools();
+  const managedCategories = section === "faq" ? Store.getFaqCategories() : Store.getToolCategories();
 
   // Group by category. Order follows Admin's managed category list (so it
-  // stays predictable/admin-controlled rather than "whatever order FAQs
+  // stays predictable/admin-controlled rather than "whatever order entries
   // happened to be entered in"), with any stray category not in that list
   // (e.g. from data entered before categories were a managed lookup)
   // appended afterwards in first-seen order as a fallback.
   const byCategory = {};
   const seenOrder = [];
-  faqs.forEach(f => {
-    const cat = (f.category || "").trim() || "Uncategorized";
+  items.forEach(it => {
+    const cat = (it.category || "").trim() || "Uncategorized";
     if (!byCategory[cat]) { byCategory[cat] = []; seenOrder.push(cat); }
-    byCategory[cat].push(f);
+    byCategory[cat].push(it);
   });
-  const managedCategories = Store.getFaqCategories();
   const categories = [
     ...managedCategories.filter(c => byCategory[c]),
     ...seenOrder.filter(c => !managedCategories.includes(c)),
   ];
 
+  const toggleBar = (
+    <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+      <button onClick={() => switchSection("faq")} style={faqSectionToggleStyle(section === "faq")}>FAQs</button>
+      <button onClick={() => switchSection("tools")} style={faqSectionToggleStyle(section === "tools")}>Tools &amp; Links</button>
+    </div>
+  );
+
   if (selectedCategory) {
-    return (
+    return section === "faq" ? (
       <FAQCategoryDetail
+        category={selectedCategory}
+        items={byCategory[selectedCategory] || []}
+        onBack={() => setSelectedCategory(null)}
+      />
+    ) : (
+      <ToolsCategoryDetail
         category={selectedCategory}
         items={byCategory[selectedCategory] || []}
         onBack={() => setSelectedCategory(null)}
@@ -1851,22 +2070,38 @@ const FAQScreen = () => {
 
   return (
     <div style={{ padding: "20px 20px 100px" }}>
-      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>FAQs</h2>
-      <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
-        Tap a category to see its questions.
-      </p>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {categories.map(cat => (
-          <button key={cat} onClick={() => setSelectedCategory(cat)} style={cardStyle}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{cat}</div>
-              <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
-                {byCategory[cat].length}
-              </span>
-            </div>
-          </button>
-        ))}
-      </div>
+      <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>
+        {section === "faq" ? "FAQs" : "Tools & Links"}
+      </h2>
+      {toggleBar}
+      {items.length === 0 ? (
+        <div style={{
+          border: "2px dashed #cbd5e1", borderRadius: 12, padding: 24,
+          color: "#94a3b8", fontSize: 13, textAlign: "center",
+        }}>
+          {section === "faq"
+            ? "No FAQs added yet — these can be added from Admin."
+            : "No tools or links added yet — these can be added from Admin."}
+        </div>
+      ) : (
+        <>
+          <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 16px" }}>
+            {section === "faq" ? "Tap a category to see its questions." : "Tap a category to see its tools & links."}
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {categories.map(cat => (
+              <button key={cat} onClick={() => setSelectedCategory(cat)} style={cardStyle}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ fontWeight: 600, fontSize: 14, color: "#0f172a" }}>{cat}</div>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                    {byCategory[cat].length}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 };
@@ -2938,6 +3173,74 @@ const AdminFaqCategories = ({ onChange }) => {
   );
 };
 
+// ── Tool categories (managed lookup, separate from FAQ categories, 2026-08-23) ──
+const ToolCategorySelect = ({ value, onChange, categories }) => (
+  <select
+    value={value} onChange={e => onChange(e.target.value)}
+    style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box", color: value ? "#0f172a" : "#94a3b8" }}
+  >
+    <option value="">{categories.length ? "Select category…" : "No categories added yet"}</option>
+    {categories.map(c => <option key={c} value={c}>{c}</option>)}
+  </select>
+);
+
+// `onChange` lets the parent (`AdminTools`) know a category was added/removed
+// so its own `categories` list refreshes too — same cross-component refresh
+// gotcha as AdminFaqCategories/AdminFAQ (this component's own `setTick` only
+// re-renders itself, not siblings).
+const AdminToolCategories = ({ onChange }) => {
+  const [, setTick] = useState(0);
+  const [newCat, setNewCat] = useState("");
+  const categories = Store.getToolCategories();
+
+  const add = () => {
+    const clean = newCat.trim();
+    if (!clean) return;
+    Store.ensureToolCategory(clean);
+    setNewCat("");
+    setTick(t => t + 1);
+    if (onChange) onChange();
+  };
+  const remove = (name) => {
+    Store.removeToolCategory(name);
+    setTick(t => t + 1);
+    if (onChange) onChange();
+  };
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      {categories.length === 0 ? (
+        <p style={{ fontSize: 13, color: "#94a3b8", margin: "0 0 12px" }}>
+          No categories yet — add one below. Tools can't be created until at least one exists.
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>
+          {categories.map(c => (
+            <span key={c} style={{
+              display: "flex", alignItems: "center", gap: 6, background: "#f1f5f9",
+              border: "1px solid #e2e8f0", borderRadius: 999, padding: "5px 6px 5px 12px", fontSize: 13,
+            }}>
+              {c}
+              <button
+                onClick={() => remove(c)}
+                aria-label={`Remove ${c}`}
+                style={{ background: "#e2e8f0", border: "none", color: "#dc2626", fontSize: 13, lineHeight: 1, width: 18, height: 18, borderRadius: "50%" }}
+              >×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={newCat} onChange={e => setNewCat(e.target.value)} placeholder="New category (e.g. Calculators)"
+          style={adminInputStyle}
+        />
+        <button onClick={add} style={adminButtonStyle}>Add</button>
+      </div>
+    </div>
+  );
+};
+
 // ── FAQ management (Admin: add/edit/delete Question + Answer + Category) ──
 const AdminFAQ = () => {
   const [, setTick] = useState(0);
@@ -3065,6 +3368,159 @@ const AdminFAQ = () => {
   );
 };
 
+// ── Tools & Links management (Admin: add/edit/delete Name + Category +
+// optional Link + optional Guide + Coming soon flag) ────────────────────
+const AdminTools = () => {
+  const [, setTick] = useState(0);
+  const [editingId, setEditingId] = useState(null);
+  const [category, setCategory] = useState("");
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [guide, setGuide] = useState("");
+  const [comingSoon, setComingSoon] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const tools = Store.getTools();
+  const categories = Store.getToolCategories();
+
+  const resetForm = () => {
+    setEditingId(null);
+    setCategory(""); setName(""); setUrl(""); setGuide(""); setComingSoon(false); setError("");
+  };
+
+  const startEdit = (t) => {
+    setError("");
+    setEditingId(t.id);
+    setCategory(t.category || "");
+    setName(t.name || "");
+    setUrl(t.url || "");
+    setGuide(t.guide || "");
+    setComingSoon(!!t.comingSoon);
+  };
+
+  const saveTool = () => {
+    setError("");
+    if (!category) { setError("Choose a category first."); return; }
+    const cleanName = name.trim();
+    if (!cleanName) { setError("Give this tool a name first."); return; }
+    const cleanUrl = url.trim();
+    const cleanGuide = guide.trim();
+    // A "coming soon" entry is a placeholder — no link or guide needed yet.
+    // Otherwise it needs at least a link or a guide, or there's nothing for
+    // anyone to actually use.
+    if (!comingSoon && !cleanUrl && !cleanGuide) {
+      setError("Add a link, a guide, or mark it Coming soon.");
+      return;
+    }
+    const payload = { category, name: cleanName, url: cleanUrl, guide: cleanGuide, comingSoon };
+    if (editingId) {
+      Store.updateTool(editingId, payload);
+    } else {
+      Store.addTool({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, ...payload });
+    }
+    resetForm();
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+    setTick(t => t + 1);
+  };
+
+  const remove = (id) => {
+    if (window.confirm("Delete this tool/link? This can't be undone.")) {
+      Store.deleteTool(id);
+      if (editingId === id) resetForm();
+      setTick(t => t + 1);
+    }
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", marginBottom: 6 }}>Categories</div>
+      <AdminToolCategories onChange={() => setTick(t => t + 1)} />
+
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8", textTransform: "uppercase", margin: "20px 0 6px" }}>New / edit tool or link</div>
+      {editingId && (
+        <div style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 8,
+          padding: "8px 12px", marginBottom: 10, fontSize: 12, color: "#1d4ed8", fontWeight: 600,
+        }}>
+          <span>Editing tool/link</span>
+          <button
+            onClick={resetForm}
+            style={{ background: "none", border: "none", color: "#1d4ed8", fontSize: 12, fontWeight: 700, padding: "2px 4px" }}
+          >Cancel</button>
+        </div>
+      )}
+
+      <ToolCategorySelect value={category} onChange={setCategory} categories={categories} />
+      <input
+        value={name} onChange={e => setName(e.target.value)}
+        placeholder="Name (e.g. Lava Calculator)"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <input
+        value={url} onChange={e => setUrl(e.target.value)}
+        placeholder="Link (optional — leave blank if it's not built/hosted yet)"
+        style={{ ...adminInputStyle, width: "100%", marginBottom: 8, boxSizing: "border-box" }}
+      />
+      <textarea
+        value={guide} onChange={e => setGuide(e.target.value)}
+        placeholder="How to use it (optional — write it however makes sense: a paragraph, your own numbered steps, whatever)"
+        rows={4}
+        style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #cbd5e1", fontSize: 14, boxSizing: "border-box", resize: "vertical", marginBottom: 8 }}
+      />
+      <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#0f172a", marginBottom: 8 }}>
+        <input type="checkbox" checked={comingSoon} onChange={e => setComingSoon(e.target.checked)} />
+        Coming soon (shows in the list, but marked as not ready yet)
+      </label>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={saveTool} style={{ ...adminButtonStyle, flex: 1 }}>
+          {editingId ? "Save changes" : "Save tool"}
+        </button>
+        {editingId && (
+          <button
+            onClick={resetForm}
+            style={{ ...adminButtonStyle, flex: 1, background: "#fff", color: "#0f172a", border: "1px solid #cbd5e1" }}
+          >Cancel</button>
+        )}
+      </div>
+      {saved && <div style={{ color: "#16a34a", fontSize: 12, marginTop: 8, textAlign: "center" }}>Saved ✓</div>}
+      {error && <div style={{ color: "#dc2626", fontSize: 12, marginTop: 8 }}>{error}</div>}
+
+      {tools.length > 0 && (
+        <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 8 }}>
+          {tools.map(t => (
+            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <span style={{ fontSize: 11, fontWeight: 600, color: "#475569", background: "#e2e8f0", padding: "2px 8px", borderRadius: 999 }}>
+                  {t.category}
+                </span>
+                {t.comingSoon && (
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#92400e", background: "#fef3c7", padding: "2px 8px", borderRadius: 999, marginLeft: 6 }}>
+                    Coming soon
+                  </span>
+                )}
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#0f172a", marginTop: 4 }}>{t.name}</div>
+              </div>
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                <button
+                  onClick={() => startEdit(t)}
+                  style={{ background: "none", border: "none", color: "#2563eb", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Edit</button>
+                <button
+                  onClick={() => remove(t.id)}
+                  style={{ background: "none", border: "none", color: "#dc2626", fontSize: 12, fontWeight: 600, padding: "4px 8px" }}
+                >Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AdminScreen = () => {
   const session = useSession();
   if (!roleAtLeast(session.role, "admin")) {
@@ -3078,7 +3534,7 @@ const AdminScreen = () => {
     <div style={{ padding: "20px 20px 100px" }}>
       <h2 style={{ fontSize: 20, color: "#0f172a", margin: "0 0 4px" }}>Admin</h2>
       <p style={{ fontSize: 14, color: "#64748b", margin: "0 0 20px" }}>
-        Passwords, divisions, event tips, rewards, epics, troops, FAQs &amp; approvals.
+        Passwords, divisions, event tips, rewards, epics, troops, FAQs, tools &amp; links, and approvals.
       </p>
 
       <div style={{ marginBottom: 24 }}>
@@ -3109,6 +3565,11 @@ const AdminScreen = () => {
       <div style={{ marginBottom: 24 }}>
         <div style={sectionLabelStyle}>FAQs</div>
         <AdminFAQ />
+      </div>
+
+      <div style={{ marginBottom: 24 }}>
+        <div style={sectionLabelStyle}>Tools &amp; Links</div>
+        <AdminTools />
       </div>
 
       <div style={{ marginBottom: 24 }}>
@@ -3232,6 +3693,7 @@ const App = () => {
   // fresh login pulls the shared copy down before the app is usable.
   const [dataReady, setDataReady] = useState(!sheetsEnabled());
   const [syncError, setSyncError] = useState(false);
+  const syncStatus = useSyncStatus(); // "idle" | "pending" | "synced" | "failed" — see Store
 
   useEffect(() => {
     if (!session) return;
@@ -3257,6 +3719,22 @@ const App = () => {
     return () => { cancelled = true; };
   }, [session]);
 
+  // Bug fix (2026-08-23): a PIN changed on one device didn't "take effect" on
+  // any OTHER device — the login screen only ever checked against whatever
+  // PINs were already cached locally on THAT device, and nothing pulled a
+  // fresh copy down until AFTER a successful login (see the effect above,
+  // gated on `session`). So a second device could never accept a newly
+  // changed PIN, since it had no way to learn about it before being asked to
+  // prove it already knew it. Fixed by also kicking off a background refresh
+  // here, before login — non-blocking (the PIN pad still appears instantly,
+  // this just quietly catches it up), and reuses loadFromRemote()'s existing
+  // "don't overwrite a newer unsynced local change" safety check, so it
+  // can't undo a PIN someone is mid-way through changing on THIS device.
+  useEffect(() => {
+    if (session || !sheetsEnabled()) return;
+    Store.loadFromRemote();
+  }, [session]);
+
   const handleLogout = () => {
     saveSession(null);
     setSession(null);
@@ -3277,6 +3755,16 @@ const App = () => {
       {syncError && (
         <div style={{ background: "#fef3c7", color: "#92400e", fontSize: 12, textAlign: "center", padding: "6px 12px" }}>
           Couldn't reach the shared data — showing this device's local copy instead.
+        </div>
+      )}
+      {/* Visible instead of a silent failure — see the 2026-08-23 sync-verification
+          note near syncToSheetsWithRetry(). Deliberately only shown once retries
+          are exhausted ("failed"), not on "pending" — every normal save goes
+          through a brief pending state, and flashing a banner for that would be
+          noise rather than a signal. */}
+      {syncStatus === "failed" && (
+        <div style={{ background: "#fee2e2", color: "#991b1b", fontSize: 12, textAlign: "center", padding: "6px 12px" }}>
+          Your last change hasn't reached the shared copy yet — it's still saved on this device, and will keep retrying.
         </div>
       )}
       <AppShell role={session.role} onLogout={handleLogout} />
