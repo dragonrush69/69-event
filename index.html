@@ -344,7 +344,11 @@ async function syncFromCT() {
   if (result.success) {
     // Reload fresh data so ctSync/scores update in-memory
     const fresh = await loadFromSheets();
-    if (fresh && !fresh.error) window._appData = fresh;
+    if (fresh && !fresh.error) {
+      window._appData = fresh;
+      // Trigger a full-tree re-render so every component picks up the new scores
+      if (typeof window._refreshApp === "function") window._refreshApp();
+    }
   }
   return result;
 }
@@ -5438,6 +5442,8 @@ function App() {
   const [preloading,   setPreloading]   = useState(false);
   const [preloadError, setPreloadError] = useState(false);
   const forceUpdate = useForceUpdate();
+  // Expose globally so syncFromCT can trigger a full-tree re-render after updating window._appData
+  window._refreshApp = forceUpdate;
 
   // Pre-load Sheets data before showing the login screen so PINs are always fresh.
   // Retries up to 3 times (handles Apps Script cold starts). If all attempts fail,
